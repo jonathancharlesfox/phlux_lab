@@ -1,0 +1,81 @@
+# =========================
+# OS / Editor
+# =========================
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# =========================
+# Logs / temp
+# =========================
+*.log
+logs/
+tmp/
+temp/
+
+# =========================
+# Secrets
+# =========================
+.env
+.env.*
+*.key
+*.pem
+*.pfx
+*.p12
+secrets/
+credentials/
+config.local.*
+*.local.yaml
+*.local.yml
+*.local.json
+
+# =========================
+# Data / outputs
+# =========================
+data/
+datasets/
+outputs/
+runs/
+artifacts/
+cache/
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.h5
+*.npz
+*.npy
+
+# =========================
+# ML models (DO NOT COMMIT)
+# =========================
+models/
+*.keras
+*.pt
+*.pth
+*.onnx
+*.joblib
+*.pkl

@@ -1,0 +1,42 @@
+deactivate --> deactivate virtual env
+python -m pip install -e . --> install project into virtual env
+python -m venv .venv  --> create virtual env
+.\.venv\Scripts\Activate.ps1 --> activate virtual env
+python -m pip freeze > requirements.txt --> saves a requirements.txt
+
+python -m uvicorn phlux_runtime.api.main:app --reload --> activates API
+
+
+$body = @{
+  suction_pressure    = 2.5      # bar
+  discharge_pressure = 6.0      # bar
+  delta_pressure     = 3.5      # bar (can be discharge - suction or whatever your model expects)
+  speed              = 1800     # rpm
+  temperature        = 25.0     # degC
+  fluid_density      = 1000.0   # kg/m3
+  fluid_viscosity    = 1.0      # cP
+  pump_power         = 10.0     # kW
+  valve_opening      = 0.6      # frac
+  sink_pressure      = 2.5      # bar
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8000/predict" `
+  -Method POST `
+  -ContentType "application/json" `
+  -Body $body
+
+Docker
+PS C:\phlux_runtime> docker build -t phlux-runtime:local .   --> builds the image, not the container
+docker images --> to see image details
+docker rmi <IMAGE ID NAME> --> to delete images 
+
+Spinning up container
+docker run --rm -p 8000:8000 `
+  -e PHLUX_API_KEY="local-test-key" `
+  -e PHLUX_REQUIRE_API_KEY="1" `
+  -e PHLUX_MODEL_DIR="/models" `
+  -e CUDA_VISIBLE_DEVICES="-1" `
+  -v "C:\phlux_models\ClientA_v1:/models:ro" `
+  phlux-runtime:local
+

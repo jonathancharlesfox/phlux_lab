@@ -1,0 +1,10 @@
+[project]
+name = "phlux"
+version = "0.1.0"
+description = "Synthetic data + ML VFM"
+requires-python = ">=3.9"
+dependencies = []
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
