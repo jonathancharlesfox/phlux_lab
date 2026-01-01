@@ -3,6 +3,7 @@ from __future__ import absolute_import, division, print_function
 import logging
 import os
 from typing import List, NoReturn, Dict, Any, Optional, Tuple
+from pathlib import Path
 
 import numpy as np
 import tensorflow as tf
@@ -11,6 +12,10 @@ from tensorflow.keras.callbacks import EarlyStopping, History, CSVLogger  # type
 
 from .ann_model import ANNModel, OutputHeadSpec
 from ..utils.preprocessor import Preprocessor
+
+LAB_ROOT = Path(__file__).resolve().parents[2]   # .../phlux_lab
+DEFAULT_LOG_DIR = str(LAB_ROOT / "logs")
+DEFAULT_MODEL_DIR = str(LAB_ROOT / "models")
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -40,8 +45,8 @@ class VFMModel(object):
         earlystop: bool = True,
         num_folds: int = 5,
         val_split: float = 0.001,
-        log_dir: str = "logs",
-        model_dir: str = "models",
+        log_dir: str = DEFAULT_LOG_DIR,
+        model_dir: str = DEFAULT_MODEL_DIR,
         multitask_cfg: Optional[Dict[str, Any]] = None,
     ) -> NoReturn:
 
@@ -77,8 +82,8 @@ class VFMModel(object):
         cls,
         preprocessor: Preprocessor,
         model_cfg: Dict[str, Any],
-        log_dir: str = "logs",
-        model_dir: str = "models",
+        log_dir: str = DEFAULT_LOG_DIR,
+        model_dir: str = DEFAULT_MODEL_DIR
     ) -> "VFMModel":
         nodes_layers = model_cfg.get("nodes_layers", [64, 64, 64])
         act_func = model_cfg.get("activation", "tanh")
@@ -123,8 +128,9 @@ class VFMModel(object):
                 EarlyStopping(
                     monitor=monitor,
                     mode="min",
-                    patience=10,
+                    patience=5,
                     verbose=1,
+                    min_delta=1e-4,          # ignore tiny changes
                     restore_best_weights=True,
                 )
             )

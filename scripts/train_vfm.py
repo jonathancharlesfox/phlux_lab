@@ -6,10 +6,12 @@ os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"  # optional
 
 from pathlib import Path
 import yaml
+import traceback
 
-from phlux_lab.utils.preprocessor import Preprocessor
-from phlux_lab.ml.vfm_model import VFMModel
+from phlux_lab.utils.preprocessor import Preprocessor # type: ignore
+from phlux_lab.ml.vfm_model import VFMModel # type: ignore
 
+LAB_ROOT = Path(__file__).resolve().parents[1]   # adjust if script depth differs
 
 def _base_name(col: str) -> str:
     """Convert 'suction_pressure__bar' -> 'suction_pressure'."""
@@ -33,7 +35,7 @@ def _infer_schema_path(train_csv: str) -> str:
 
 def main() -> None:
     # Load training_config.yaml
-    with open("configs/training_config.yaml", "r", encoding="utf-8") as f:
+    with open("phlux_lab/configs/training_config.yaml", "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
 
     client_name = cfg.get("client_name") or "Client"
@@ -197,11 +199,11 @@ def main() -> None:
         vfm.train_model()
 
     # Save artifacts under models/<client_name>/
-    out_dir = Path("models") / str(client_name)
+    out_dir = LAB_ROOT / "models" / str(client_name)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    model_rel = str(Path(str(client_name)) / f"vfm_{client_name}.keras")  # relative to models/
-    model_path = vfm.save_model(model_rel)
+    model_path = out_dir / f"vfm_{client_name}.keras"
+    vfm.save_model(str(model_path))
 
     artifact_path = pp.save_artifact(str(out_dir / "preprocessor.joblib"))
 

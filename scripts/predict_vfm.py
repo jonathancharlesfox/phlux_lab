@@ -3,17 +3,17 @@ from __future__ import annotations
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-
-from phlux_lab.utils.predictor import VfmPredictor
+from pathlib import Path
 
 # ============================================================
 # USER SETTINGS (easy to edit)
 # ============================================================
 
-MODEL_TO_USE = r"models\ClientA\vfm_ClientA.keras"
-PREPROCESSOR_TO_USE = r"models\ClientA\preprocessor.joblib"
+LAB_ROOT = Path(__file__).resolve().parents[1]  # phlux_lab
+MODEL_TO_USE = LAB_ROOT / "models" / "ClientA" / "vfm_ClientA.keras"
+PREPROCESSOR_TO_USE = LAB_ROOT / "models" / "ClientA" / "preprocessor.joblib"
 RETURN_UNITS = "user"   # options: "user", "canonical"
-
+from phlux_lab.utils.predictor import VfmPredictor # type: ignore
 
 # YAML-like structure: you explicitly declare (value, unit) per input.
 # These units can be DIFFERENT than the dataset schema units.

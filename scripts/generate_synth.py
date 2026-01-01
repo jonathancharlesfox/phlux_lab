@@ -8,17 +8,16 @@ from pathlib import Path
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"   # 2=hide INFO, 3=hide INFO+WARNING
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"  # optional
 
-# Ensure project root is importable BEFORE importing phlux_lab
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+# --- Paths ---
+HERE = Path(__file__).resolve().parent          # phlux_lab/scripts
+LAB_ROOT = HERE.parent                          # phlux_lab
+DEFAULT_CONFIG = LAB_ROOT / "configs" / "synthgen_config.yaml"
 
-from phlux_lab.datagen.centrifugal import CentrifugalPumpDatasetGenerator  # noqa: E402
-
-# Default config path if none is provided via CLI
-DEFAULT_CONFIG = ROOT / "configs" / "synthgen_config.yaml"
+from phlux_lab.datagen.centrifugal.generator import CentrifugalPumpDatasetGenerator # type: ignore
 
 
 def main() -> None:
+    
     parser = argparse.ArgumentParser(description="Synthetic dataset generator for Phlux VFM.")
     parser.add_argument(
         "--config",
@@ -56,6 +55,7 @@ def main() -> None:
         raise ValueError(f"Unknown equipment_type: {eq_type}")
 
     gen = GenClass.from_yaml(str(cfg_path))
+    print("  • Generating synthetic data...")
     train_path, test_path = gen.export_csv_and_schema()
 
     print("\n✔ Synthetic datasets generated:")

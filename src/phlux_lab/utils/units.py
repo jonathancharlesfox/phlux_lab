@@ -127,6 +127,35 @@ def _rpm_to_rps(rpm: float) -> float:
     return rpm / 60.0
 
 
+# =========================================================
+# Length / Size Conversions (internal: m)
+# =========================================================
+
+def _mm_to_m(mm: float) -> float:
+    return mm / 1_000.0
+
+def _cm_to_m(cm: float) -> float:
+    return cm / 100.0
+
+def _in_to_m(inches: float) -> float:
+    return inches * 0.0254
+
+def _ft_to_m(ft: float) -> float:
+    return ft * 0.3048
+
+def _m_to_mm(m: float) -> float:
+    return m * 1_000.0
+
+def _m_to_cm(m: float) -> float:
+    return m * 100.0
+
+def _m_to_in(m: float) -> float:
+    return m / 0.0254
+
+def _m_to_ft(m: float) -> float:
+    return m / 0.3048
+
+
 
 # =========================================================
 # Canonical internal units (the unit system used inside Phlux)
@@ -141,6 +170,7 @@ CANONICAL_INTERNAL_UNITS: dict[str, str] = {
     "viscosity": "Pa*s",
     "speed": "rpm",
     "power": "W",
+    "length": "m",
 }
 
 def unit_dimension(unit: str) -> str:
@@ -174,6 +204,9 @@ def unit_dimension(unit: str) -> str:
 
     if u in ("W", "kW", "hp", "HP"):
         return "power"
+
+    if u in ("m", "meter", "meters", "mm", "cm", "in", "inch", "inches", "ft", "feet"):
+        return "length"
 
     raise ValueError(f"Unknown/unsupported unit for dimension inference: '{unit}'")
 
@@ -260,6 +293,18 @@ def convert_user_to_internal_SI(value: float, unit: str) -> float:
     if u in ("hp", "HP"):
         return _hp_to_W(value)
 
+    # -------------- Length -> m ---------------------
+    if u in ("m", "meter", "meters"):
+        return float(value)
+    if u in ("mm",):
+        return _mm_to_m(float(value))
+    if u in ("cm",):
+        return _cm_to_m(float(value))
+    if u in ("in", "inch", "inches"):
+        return _in_to_m(float(value))
+    if u in ("ft", "feet"):
+        return _ft_to_m(float(value))
+
     raise ValueError(f"Unsupported unit in convert_user_to_internal_SI(): '{unit}'")
 
 def convert_internal_back_to_user(value: float, unit: str) -> float:
@@ -340,6 +385,18 @@ def convert_internal_back_to_user(value: float, unit: str) -> float:
     if u in ("hp", "HP"):
         return _W_to_hp(value)
 
+    # -------------- m -> Length ---------------------
+    if u in ("m", "meter", "meters"):
+        return float(value)
+    if u in ("mm",):
+        return _m_to_mm(float(value))
+    if u in ("cm",):
+        return _m_to_cm(float(value))
+    if u in ("in", "inch", "inches"):
+        return _m_to_in(float(value))
+    if u in ("ft", "feet"):
+        return _m_to_ft(float(value))
+
     raise ValueError(f"Unsupported unit in convert_internal_back_to_user(): '{unit}'")
 
 """
@@ -390,5 +447,8 @@ Supported (common) units:
 
     Power:
         W, kW, hp
+
+    Length / size:
+        m, mm, cm, in, ft
 ---------------------------------------------------------
 """

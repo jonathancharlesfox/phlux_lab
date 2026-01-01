@@ -9,31 +9,34 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from pathlib import Path
 
 from sklearn.metrics import r2_score
 
-from phlux_lab.utils.predictor import VfmPredictor
-from phlux_lab.utils.units import convert_user_to_internal_SI, convert_internal_back_to_user
+from phlux_lab.utils.predictor import VfmPredictor # type: ignore 
+from phlux_lab.utils.units import convert_user_to_internal_SI, convert_internal_back_to_user # type: ignore
 
+# MAE (Mean Absolute Error): Measures typical prediction error in original units.
+# RMSE (Root Mean Squared Error): Penalizes larger errors more strongly than MAE.
+# R² (Coefficient of Determination): Proportion of variance in the target explained by the model; 1.0 indicates a perfect fit.
 
 # =========================================================
 # USER INPUTS (EDIT THESE)
 # =========================================================
-MODEL_TO_USE = r"models\ClientA\vfm_ClientA.keras"
-PREPROCESSOR_TO_USE = r"models\ClientA\preprocessor.joblib"
-TEST_CSV = r"data/synthetic/ClientA_centrifugal_dataset_test.csv"
+LAB_ROOT = Path(__file__).resolve().parents[1]  # phlux_lab
+MODEL_TO_USE = LAB_ROOT / "models" / "ClientA" / "vfm_ClientA.keras"
+PREPROCESSOR_TO_USE = LAB_ROOT / "models" / "ClientA" / "preprocessor.joblib"
+TEST_CSV = LAB_ROOT / "data" / "synthetic" / "ClientA_centrifugal_dataset_test.csv"
 
 # Choose: "user" (schema units) or "canonical" (SI)
 REPORT_UNITS = "user"   # "user" or "canonical"
 # =========================================================
-
 
 # Canonical SI unit labels for plots (extend as needed)
 CANONICAL_UNIT_LABELS = {
     "q_liquid": "m3/s",
     "hydraulic_wear": "frac",
 }
-
 
 def _unit_label(target: str, schema_units_by_col: Dict[str, str], report_units: str) -> str:
     """
@@ -69,7 +72,6 @@ def _to_canonical_matrix(df: pd.DataFrame, cols: List[str], units_map: Dict[str,
 
     return out
 
-
 def _canonical_to_user_matrix(y_canonical: np.ndarray, cols: List[str], units_map: Dict[str, str]) -> np.ndarray:
     """
     Convert canonical SI -> schema USER units (vectorized per column).
@@ -89,13 +91,11 @@ def _canonical_to_user_matrix(y_canonical: np.ndarray, cols: List[str], units_ma
 
     return out
 
-
 def _mae_rmse_per_target(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     err = (y_pred - y_true).astype("float32")
     mae = np.mean(np.abs(err), axis=0)
     rmse = np.sqrt(np.mean(err * err, axis=0))
     return mae, rmse
-
 
 def main() -> None:
     report_units = str(REPORT_UNITS).lower().strip()
@@ -222,7 +222,6 @@ def main() -> None:
     plt.show()
 
     print("\nEvaluation complete.")
-
 
 if __name__ == "__main__":
     main()

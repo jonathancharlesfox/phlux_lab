@@ -1,16 +1,30 @@
+from __future__ import annotations
+
 import os
 import sys
 import csv
 import random
 from pathlib import Path
 from datetime import timedelta
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any, Optional
 
 import numpy as np
 import yaml
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"   # 2=hide INFO, 3=hide INFO+WARNING
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"  # optional: disables oneDNN message + op
+
+# ============================================================
+# Paths (repo-anchored)
+# ============================================================
+# This script should live in: phlux_lab/scripts/
+LAB_ROOT = Path(__file__).resolve().parents[1]  # .../phlux_lab
+TRAINING_CFG_PATH = LAB_ROOT / "configs" / "training_config.yaml"
+
+# Save outputs under phlux_lab/outputs/
+OUTPUT_DIR = LAB_ROOT / "outputs"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+CSV_PATH = str(OUTPUT_DIR / "kspice_vs_ml.csv")
 
 # ============================================================
 # K-Spice API Setup
@@ -35,9 +49,6 @@ VALFILE = "Phlux"
 
 # ============================================================
 # Model writes (K-Spice expects internal SI)
-#   - We set sink pressure downstream of the valve (P_SINK)
-#   - We set inlet pressure and inlet temperature
-#   - Discharge pressure (P_OUT) is NOT set; it is measured
 # ============================================================
 TAG_P_IN = "Streamboundary1:InputPressure"
 TAG_T_IN = "Streamboundary1:InputTemperature"
@@ -64,7 +75,7 @@ TAG_P_SINK_MEAS = "Streamboundary2:InputPressure"  # Pa (setpoint / optional rea
 
 # Fluid properties from K-Spice (SI)
 TAG_DENSITY_KG_M3 = "PipeFlow1:OutletStream.r"  # kg/m3
-TAG_VISCOSITY_PA_S = "PipeFlow1:Viscosity"      # Pa*s  (you said KS provides Pa*s)
+TAG_VISCOSITY_PA_S = "PipeFlow1:Viscosity"      # Pa*s
 
 READ_SINK_MEAS = True
 
@@ -84,89 +95,75 @@ if READ_SINK_MEAS:
 # ============================================================
 # Units helper
 # ============================================================
-from phlux_lab.utils.units import convert_internal_back_to_user
+from phlux_lab.utils.units import convert_internal_back_to_user  # type: ignore
 
 # ============================================================
-# Training-config-driven feature definitions
+# Default user units for unitless feature names
+# (matches what you want to see in CSV + what predict_vfm.py expects)
 # ============================================================
-TRAINING_CFG_PATH = Path("configs") / "training_config.yaml"
+DEFAULT_USER_UNITS: Dict[str, str] = {
+    "suction_pressure": "bar",
+    "discharge_pressure": "bar",
+    "sink_pressure": "bar",
+    "delta_pressure": "bar",
+    "temperature": "degC",
+    "speed": "rpm",
+    "fluid_density": "kg/m3",
+    "fluid_viscosity": "cP",   # we will convert Pa*s -> cP
+    "pump_power": "kW",
+    "valve_opening": "frac",
+    "hydraulic_wear": "frac",
+    "q_liquid": "m3/h",
+    "valve_dp": "bar",
+}
 
-def load_training_profile() -> Tuple[str, dict, dict, List[str], List[str]]:
+# ============================================================
+# Training-config reader (NEW FORMAT)
+# ============================================================
+def load_training_config() -> Tuple[str, Dict[str, Any], Dict[str, Any], List[str], List[str], Dict[str, Any]]:
     """
-    Returns:
-      active_profile_name, profile_cfg, model_cfg, input_cols, target_cols
+    Reads phlux_lab/configs/training_config.yaml (new format).
 
-    IMPORTANT:
-      - input_cols and target_cols are now defined explicitly in training_config.yaml
-        under profiles:<active_profile>:
-          input_features: [...]
-          targets: [...]
+    Returns:
+      client_name, data_cfg, model_cfg, input_cols, target_cols, wear_prob_cfg
     """
     with open(TRAINING_CFG_PATH, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+        cfg = yaml.safe_load(f) or {}
 
-    profiles = cfg.get("profiles", {})
-    if not profiles:
-        raise KeyError("training_config.yaml must contain a non-empty 'profiles:' block.")
+    client_name = str(cfg.get("client_name", "")).strip()
+    if not client_name:
+        raise KeyError("training_config.yaml must define non-empty 'client_name:'")
 
-    active = cfg.get("active_profile") or next(iter(profiles.keys()))
-    if active not in profiles:
-        raise KeyError(f"active_profile='{active}' not found. Available: {list(profiles.keys())}")
-
-    profile_cfg = profiles[active]
     model_cfg = cfg.get("model", {}) or {}
+    data_cfg = cfg.get("data", {}) or {}
 
-    input_cols = profile_cfg.get("input_features")
-    target_cols = profile_cfg.get("targets")
+    input_cols = data_cfg.get("input_features")
+    target_cols = data_cfg.get("targets")
 
     if not input_cols or not isinstance(input_cols, list):
-        raise KeyError(
-            f"Profile '{active}' must define 'input_features' as a list of CSV column names "
-            f"(including units, e.g. suction_pressure__bar)."
-        )
+        raise KeyError("training_config.yaml must define data.input_features as a non-empty list.")
     if not target_cols or not isinstance(target_cols, list):
-        raise KeyError(
-            f"Profile '{active}' must define 'targets' as a list of CSV column names "
-            f"(including units, e.g. q_liquid__m3/h)."
-        )
+        raise KeyError("training_config.yaml must define data.targets as a non-empty list.")
 
-    return active, profile_cfg, model_cfg, input_cols, target_cols
+    # Wear probability config (new preferred location in your training script was top-level hydraulic_wear_head)
+    wear_prob_cfg: Dict[str, Any] = {}
+    hw = cfg.get("hydraulic_wear_head", {}) or {}
+    prob = (hw.get("probability", {}) or {}) if isinstance(hw, dict) else {}
+    # allow older nested multitask keys too (won't break if absent)
+    mt = (model_cfg.get("multitask", {}) or {}) if isinstance(model_cfg, dict) else {}
+    prob2 = ((mt.get("hydraulic_wear_head", {}) or {}).get("probability", {}) or {}) if isinstance(mt, dict) else {}
 
+    wear_prob_cfg = dict(prob2) if prob2 else dict(prob)
+    # Normalize to predictor interface (expects enabled/method/wear_lo/wear_hi at least)
+    if wear_prob_cfg:
+        wear_prob_cfg = {
+            "enabled": True,
+            "method": str(wear_prob_cfg.get("method", "linear")),
+            "wear_lo": float(wear_prob_cfg.get("wear_lo", 0.0)),
+            "wear_hi": float(wear_prob_cfg.get("wear_hi", wear_prob_cfg.get("wear_lo", 0.0) + 0.01)),
+        }
 
-# ============================================================
-# ML Predictor (artifact-based)
-# ============================================================
-USE_ML_MODEL = True
-PRINT_ML_DEBUG = False  # set True if you want to print every case inputs
-
-predictor = None
-active_profile, profile_cfg, model_cfg, INPUT_COLS, TARGET_COLS = load_training_profile()
-
-DEFAULT_MODEL_PATH = Path("models") / active_profile / f"vfm_{active_profile}.keras"
-ML_MODEL_PATH = str(DEFAULT_MODEL_PATH)
-
-if USE_ML_MODEL:
-    try:
-        from phlux_lab.utils.predictor import VfmPredictor
-        predictor = VfmPredictor.from_paths(ML_MODEL_PATH)
-        print(f"✅ Loaded ML predictor from: {ML_MODEL_PATH}")
-    except Exception as e:
-        print(f"⚠️ Could not load ML predictor: {e}")
-        USE_ML_MODEL = False
-
-# ============================================================
-# Sampling controls (internal SI for K-Spice boundaries)
-# ============================================================
-N_CASES = 100
-CSV_PATH = "kspice_vs_ml.csv"
-
-P_IN_RANGE_PA = (1.0e5, 3.0e5)
-P_SINK_RANGE_PA = (2.0e5, 5.0e5)
-T_IN_RANGE_K = (288.15, 298.15)  # 15–25 °C
-
-VALVE_OPENING_RANGE_FRAC = (0.4, 0.7)
-HYDRAULIC_WEAR_RANGE = (0.06, 0.06)
-DEFAULT_SPEED_RPM = 1800.0
+    return client_name, data_cfg, model_cfg, input_cols, target_cols, wear_prob_cfg
 
 # ============================================================
 # Feature mapping helpers
@@ -174,21 +171,22 @@ DEFAULT_SPEED_RPM = 1800.0
 def _col_unit_suffix(col: str) -> str:
     return col.split("__", 1)[1] if "__" in col else ""
 
-
 def _internal_name(col: str) -> str:
     return col.split("__", 1)[0] if "__" in col else col
 
-
-def _derived_output_cols_from_profile(profile_cfg: dict) -> set[str]:
-    derived = profile_cfg.get("derived_features", []) or []
+def _derived_cols_from_data_cfg(data_cfg: dict) -> set[str]:
+    derived = data_cfg.get("derived_features", []) or []
     out = set()
     for d in derived:
-        name = d.get("name")
-        unit = d.get("unit")
-        if name and unit:
-            out.add(f"{name}__{unit}")
+        if isinstance(d, dict) and d.get("name"):
+            out.add(str(d["name"]))
     return out
 
+def _resolved_unit(col: str) -> str:
+    suf = _col_unit_suffix(col)
+    if suf:
+        return suf
+    return DEFAULT_USER_UNITS.get(_internal_name(col), "")
 
 def _user_value_for_col(
     col: str,
@@ -200,12 +198,12 @@ def _user_value_for_col(
     ks_pwr_w: float,
     speed_rpm: float,
     density_kg_m3: float,
-    viscosity_pa_s: float,  # SI from K-Spice (Pa*s)
+    viscosity_pa_s: float,
     valve_opening_frac: float,
     hydraulic_wear_frac: float,
 ) -> float:
-    unit = _col_unit_suffix(col) or ""
-    c = col.lower()
+    unit = _resolved_unit(col) or ""
+    c = _internal_name(col).lower()
 
     if "suction" in c and "pressure" in c:
         return float(convert_internal_back_to_user(ks_p_in_pa, unit or "Pa"))
@@ -227,15 +225,12 @@ def _user_value_for_col(
         return float(convert_internal_back_to_user(speed_rpm, unit or "rpm"))
 
     if "density" in c:
-        # KS gives kg/m3 already; convert only if model wants something else
         return float(convert_internal_back_to_user(density_kg_m3, unit or "kg/m3"))
 
     if "viscos" in c:
-        # IMPORTANT: KS gives Pa*s, but your ML features may be in cP.
-        # Do explicit conversion for the ML model when unit suffix requests cP.
+        # K-Spice gives Pa*s; your features are usually in cP
         if unit.lower() in {"cp", "cpoise"}:
             return float(viscosity_pa_s * 1000.0)  # 1 Pa*s = 1000 cP
-        # otherwise use the shared converter (or return SI)
         return float(convert_internal_back_to_user(viscosity_pa_s, unit or "Pa*s"))
 
     if "valve" in c and ("opening" in c or "open" in c or "position" in c):
@@ -247,15 +242,21 @@ def _user_value_for_col(
     if "pump_power" in c or ("power" in c and "pump" in c):
         return float(convert_internal_back_to_user(ks_pwr_w, unit or "W"))
 
-    if col.startswith("head_proxy"):
+    if c.startswith("head_proxy"):
+        # If you have this as a derived feature, your Preprocessor can compute it.
+        # We keep it here in case your model expects it as an explicit input.
         dp_bar = float(convert_internal_back_to_user(ks_p_out_pa - ks_p_in_pa, "bar"))
         dens = float(convert_internal_back_to_user(density_kg_m3, "kg/m3"))
         return dp_bar / max(dens, 1e-12)
 
+    if "valve_dp" in c:
+        # dp across valve == discharge - sink (if that's how you defined it)
+        dp_pa = ks_p_out_pa - ks_p_sink_pa
+        return float(convert_internal_back_to_user(dp_pa, unit or "Pa"))
+
     raise RuntimeError(f"Unhandled input feature column: '{col}'")
 
-
-def build_feature_values(
+def build_feature_inputs_for_predictor(
     cols: List[str],
     *,
     ks_p_in_pa: float,
@@ -268,10 +269,16 @@ def build_feature_values(
     viscosity_pa_s: float,
     valve_opening_frac: float,
     hydraulic_wear_frac: float,
-) -> Dict[str, float]:
-    fv: Dict[str, float] = {}
+) -> Dict[str, Dict[str, float]]:
+    """
+    Build predictor-style input dict:
+      {"suction_pressure": {"value": 2.5, "unit": "bar"}, ...}
+    """
+    out: Dict[str, Dict[str, float]] = {}
     for col in cols:
-        fv[_internal_name(col)] = _user_value_for_col(
+        name = _internal_name(col)
+        unit = _resolved_unit(col) or DEFAULT_USER_UNITS.get(name, "")
+        val = _user_value_for_col(
             col,
             ks_p_in_pa=ks_p_in_pa,
             ks_p_out_pa=ks_p_out_pa,
@@ -284,29 +291,64 @@ def build_feature_values(
             valve_opening_frac=valve_opening_frac,
             hydraulic_wear_frac=hydraulic_wear_frac,
         )
-    return fv
+        out[name] = {"value": float(val), "unit": str(unit) if unit else ""}
+    return out
 
+def _pick_flow_key(pred: Dict[str, Any], targets: List[str]) -> Optional[str]:
+    # Prefer target name if present
+    for t in targets:
+        if t in pred:
+            return t
+    # Common fallbacks
+    for k in ("q_liquid", "flow"):
+        if k in pred:
+            return k
+    # Last resort: first numeric key not probability
+    skip = {"hydraulic_wear_probability_pct", "degradation_probability_pct"}
+    for k, v in pred.items():
+        if k in skip:
+            continue
+        if isinstance(v, (int, float)):
+            return k
+    return None
 
-def _extract_ml_outputs(pred_dict: Dict[str, float]) -> Tuple[float, float]:
-    """
-    Returns:
-      (ml_flow_pred, ml_deg_prob_pct)
+# ============================================================
+# ML Predictor (artifact-based) - same call signature as predict_vfm.py
+# ============================================================
+USE_ML_MODEL = True
+PRINT_ML_DEBUG = False  # set True if you want to print every case inputs
 
-    - Works for single-head: deg_prob_pct = NaN
-    - Works for two-head: both returned
-    """
-    deg_prob_pct = float("nan")
-    if "degradation_probability_pct" in pred_dict:
-        deg_prob_pct = float(pred_dict["degradation_probability_pct"])
+predictor = None
+CLIENT_NAME, DATA_CFG, MODEL_CFG, INPUT_COLS, TARGET_COLS, WEAR_PROB_CFG = load_training_config()
 
-    # Flow: pick the first key that is NOT the degradation score
-    flow_keys = [k for k in pred_dict.keys() if k != "degradation_probability_pct"]
-    if not flow_keys:
-        return float("nan"), deg_prob_pct
+MODEL_PATH = LAB_ROOT / "models" / CLIENT_NAME / f"vfm_{CLIENT_NAME}.keras"
+PREPROCESSOR_PATH = LAB_ROOT / "models" / CLIENT_NAME / "preprocessor.joblib"
 
-    ml_flow_pred = float(pred_dict[flow_keys[0]])
-    return ml_flow_pred, deg_prob_pct
+if USE_ML_MODEL:
+    try:
+        from phlux_lab.utils.predictor import VfmPredictor  # type: ignore
+        predictor = VfmPredictor.from_paths(
+            model_path=str(MODEL_PATH),
+            preprocessor_path=str(PREPROCESSOR_PATH),
+        )
+        print(f"✅ Loaded ML predictor from: {MODEL_PATH}")
+        print(f"✅ Loaded preprocessor from: {PREPROCESSOR_PATH}")
+    except Exception as e:
+        print(f"⚠️ Could not load ML predictor: {e}")
+        USE_ML_MODEL = False
 
+# ============================================================
+# Sampling controls (internal SI for K-Spice boundaries)
+# ============================================================
+N_CASES = 100
+
+P_IN_RANGE_PA = (1.0e5, 3.0e5)
+P_SINK_RANGE_PA = (2.0e5, 5.0e5)
+T_IN_RANGE_K = (288.15, 298.15)  # 15–25 °C
+
+VALVE_OPENING_RANGE_FRAC = (0.1, 0.75)
+HYDRAULIC_WEAR_RANGE = (0.0, 0.1)
+DEFAULT_SPEED_RPM = 1800.0
 
 # ============================================================
 # K-Spice Boot
@@ -363,16 +405,12 @@ for i in range(N_CASES):
     ks_pwr_w = out[TAG_PWR_MEAS]
 
     # sink pressure
-    if READ_SINK_MEAS:
-        ks_p_sink_pa = out[TAG_P_SINK_MEAS]
-    else:
-        ks_p_sink_pa = float(p_sink)
-
+    ks_p_sink_pa = out[TAG_P_SINK_MEAS] if READ_SINK_MEAS else float(p_sink)
     speed_rpm = float(DEFAULT_SPEED_RPM)
 
     # fluid props (SI from K-Spice)
-    density_kg_m3 = out[TAG_DENSITY_KG_M3]       # kg/m3
-    viscosity_pa_s = out[TAG_VISCOSITY_PA_S]     # Pa*s
+    density_kg_m3 = out[TAG_DENSITY_KG_M3]
+    viscosity_pa_s = out[TAG_VISCOSITY_PA_S]
 
     # CSV conversions (user units)
     ks_p_in_bar = float(convert_internal_back_to_user(ks_p_in_pa, "bar"))
@@ -384,25 +422,21 @@ for i in range(N_CASES):
     ks_flow_m3h = float(convert_internal_back_to_user(ks_flow_m3s, "m3/h"))
     speed_csv = float(convert_internal_back_to_user(speed_rpm, "rpm"))
     dens_csv = float(convert_internal_back_to_user(density_kg_m3, "kg/m3"))
+    visc_csv_cp = float(viscosity_pa_s * 1000.0)  # 1 Pa*s = 1000 cP
 
-    # 1 Pa*s = 1000 cP
-    visc_csv_cp = float(viscosity_pa_s * 1000.0)
-
-    head_proxy = ks_dp_bar / max(dens_csv, 1e-12)
-
-    # ML predict
-    ml_flow_pred = float("nan")
-    ml_deg_prob_pct = float("nan")
+    # ML predict (force user units)
+    ml_flow_pred_m3h = float("nan")
+    ml_wear_prob_pct = float("nan")
     flow_err_pct = float("nan")
 
     if USE_ML_MODEL and predictor is not None:
         cols_for_model = predictor.input_cols if getattr(predictor, "input_cols", None) else INPUT_COLS
 
-        # don't build values for derived features here (Preprocessor will compute them)
-        derived_cols = _derived_output_cols_from_profile(profile_cfg)
-        base_cols = [c for c in cols_for_model if c not in derived_cols]
+        # Exclude derived feature names; Preprocessor computes them
+        derived_cols = _derived_cols_from_data_cfg(DATA_CFG)
+        base_cols = [c for c in cols_for_model if _internal_name(c) not in derived_cols]
 
-        feature_values = build_feature_values(
+        feature_inputs = build_feature_inputs_for_predictor(
             base_cols,
             ks_p_in_pa=ks_p_in_pa,
             ks_p_out_pa=ks_p_out_pa,
@@ -411,19 +445,32 @@ for i in range(N_CASES):
             ks_pwr_w=ks_pwr_w,
             speed_rpm=speed_rpm,
             density_kg_m3=density_kg_m3,
-            viscosity_pa_s=viscosity_pa_s,   # Pa*s from KS (conversion happens per feature unit)
+            viscosity_pa_s=viscosity_pa_s,
             valve_opening_frac=valve_opening_frac,
             hydraulic_wear_frac=hydraulic_wear_frac,
         )
 
         if PRINT_ML_DEBUG and hasattr(predictor, "debug_print_model_inputs"):
-            predictor.debug_print_model_inputs(feature_values)
+            predictor.debug_print_model_inputs(feature_inputs)
 
-        pred_dict = predictor.predict(feature_values)
-        ml_flow_pred, ml_deg_prob_pct = _extract_ml_outputs(pred_dict)
+        pred = predictor.predict(
+            feature_inputs=feature_inputs,
+            wear_probability_cfg=WEAR_PROB_CFG if WEAR_PROB_CFG.get("enabled", False) else None,
+            return_units="user",
+        )
 
-        if np.isfinite(ml_flow_pred) and abs(ks_flow_m3h) > 1e-9:
-            flow_err_pct = 100.0 * abs(ml_flow_pred - ks_flow_m3h) / abs(ks_flow_m3h)
+        flow_key = _pick_flow_key(pred, TARGET_COLS)
+        if flow_key is not None and isinstance(pred.get(flow_key), (int, float)):
+            ml_flow_pred_m3h = float(pred[flow_key])
+
+        # Probability key from predictor interface
+        for k in ("hydraulic_wear_probability_pct", "degradation_probability_pct"):
+            if k in pred and isinstance(pred.get(k), (int, float)):
+                ml_wear_prob_pct = float(pred[k])
+                break
+
+        if np.isfinite(ml_flow_pred_m3h) and abs(ks_flow_m3h) > 1e-9:
+            flow_err_pct = 100.0 * abs(ml_flow_pred_m3h - ks_flow_m3h) / abs(ks_flow_m3h)
 
     rows.append([
         ks_p_in_bar,
@@ -438,8 +485,8 @@ for i in range(N_CASES):
         hydraulic_wear_frac,
         valve_opening_frac,
         ks_flow_m3h,
-        ml_flow_pred,
-        ml_deg_prob_pct,
+        ml_flow_pred_m3h,
+        ml_wear_prob_pct,
         flow_err_pct,
     ])
 
@@ -460,11 +507,11 @@ header = [
     "valve_opening__frac",
     "ks_flow__m3_h",
     "ml_flow_pred__m3_h",
-    "ml_degradation_probability__pct",
+    "ml_hydraulic_wear_probability__pct",
     "flow_abs_error__pct",
 ]
 
-with open(CSV_PATH, "w", newline="") as f:
+with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
     w = csv.writer(f)
     w.writerow(header)
     w.writerows(rows)
