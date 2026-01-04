@@ -1,6 +1,5 @@
 import argparse
 import yaml
-import sys
 import os
 from pathlib import Path
 
@@ -13,11 +12,10 @@ HERE = Path(__file__).resolve().parent          # phlux_lab/scripts
 LAB_ROOT = HERE.parent                          # phlux_lab
 DEFAULT_CONFIG = LAB_ROOT / "configs" / "synthgen_config.yaml"
 
-from phlux_lab.datagen.centrifugal.generator import CentrifugalPumpDatasetGenerator # type: ignore
+from phlux_lab.datagen.centrifugal.generator import CentrifugalPumpDatasetGenerator  # type: ignore
 
 
 def main() -> None:
-    
     parser = argparse.ArgumentParser(description="Synthetic dataset generator for Phlux VFM.")
     parser.add_argument(
         "--config",
@@ -56,11 +54,17 @@ def main() -> None:
 
     gen = GenClass.from_yaml(str(cfg_path))
     print("  • Generating synthetic data...")
-    train_path, test_path = gen.export_csv_and_schema()
+    result = gen.export_csv_and_schema()
 
     print("\n✔ Synthetic datasets generated:")
-    print(f"  Train: {train_path}")
-    print(f"  Test : {test_path}\n")
+    if isinstance(result, list):
+        for p in result:
+            print(f"  - {p}")
+        print("")
+    else:
+        train_path, test_path = result
+        print(f"  Train: {train_path}")
+        print(f"  Test : {test_path}\n")
 
 
 if __name__ == "__main__":

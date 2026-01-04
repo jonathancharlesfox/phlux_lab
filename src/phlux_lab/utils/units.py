@@ -171,7 +171,14 @@ CANONICAL_INTERNAL_UNITS: dict[str, str] = {
     "speed": "rpm",
     "power": "W",
     "length": "m",
+
+    # --- derived / compound dimensions (metadata only) ---
+    "power_per_flow": "W/(m3/s)",
+    "power_per_pressure": "W/Pa",
+    "flow_per_speed": "(m3/s)/rpm",
+    "pressure_per_speed2": "Pa/(rpm^2)",
 }
+
 
 def unit_dimension(unit: str) -> str:
     """
@@ -181,9 +188,11 @@ def unit_dimension(unit: str) -> str:
     """
     u = unit.strip()
 
+    # ---------------- Dimensionless ----------------
     if u in ("frac", "fraction", "-", "1", "%", "pct", "percent"):
         return "dimensionless"
 
+    # ---------------- Base dimensions ----------------
     if u in ("Pa", "kPa", "bar", "bara", "barg", "psi", "psia", "psig"):
         return "pressure"
 
@@ -207,6 +216,19 @@ def unit_dimension(unit: str) -> str:
 
     if u in ("m", "meter", "meters", "mm", "cm", "in", "inch", "inches", "ft", "feet"):
         return "length"
+
+    # ---------------- Compound / derived units (metadata only) ----------------
+    if u in ("kW_per_m3_h", "kW/(m3/h)", "kW per m3/h"):
+        return "power_per_flow"
+
+    if u in ("kW_per_bar", "kW/bar", "kW per bar"):
+        return "power_per_pressure"
+
+    if u in ("m3_h_per_rpm", "(m3/h)/rpm", "m3/h/rpm"):
+        return "flow_per_speed"
+
+    if u in ("bar_per_rpm2", "bar/(rpm^2)", "bar per rpm^2"):
+        return "pressure_per_speed2"
 
     raise ValueError(f"Unknown/unsupported unit for dimension inference: '{unit}'")
 

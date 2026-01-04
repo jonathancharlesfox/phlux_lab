@@ -1,80 +1,261 @@
+# ============================================================
+# Phlux Synthetic Dataset Generator Config
+#   Philosophy: config in user units -> convert to canonical SI
+#               -> export back to user units defined in `data:`
+# ============================================================
+
+# ----------------------------
+# Project metadata
+# ----------------------------
 project_name: phlux_centrifugal_synth_v1
 client_name: ClientA
 equipment_type: centrifugal
 random_seed: 42
-n_samples: 50000
 unit_system: SI
-test_split: 2.5
+
+# ----------------------------
+# Dataset sizing / splitting
+# ----------------------------
+n_samples: 50000
+test_split: 2.5                        # percent
+
+# ----------------------------
+# Output settings
+# ----------------------------
 output:
   directory: phlux_lab/data/synthetic
-  filename_template: '{client_name}_centrifugal_dataset.csv'
   overwrite: true
+
+  # If you ever want to force a single custom name, set:
+  # filename_template: "{client_name}_custom.csv"
+
+# ----------------------------
+# Generation plan (one run -> many files)
+#   We sample the operating point ONCE, split ONCE, then emit
+#   train/test files per dataset spec below.
+# ----------------------------
+generation:
+
+  # ----------------------------
+  # Split behavior
+  # ----------------------------
+  split:
+    method: percent                     # "percent" (uses test_split above) or "count"
+    # test_count: 500                   # if method=count
+
+  # ----------------------------
+  # Dataset variants to emit
+  #   This produces 6 files total:
+  #     1) flow_clean_train.csv
+  #     2) flow_clean_test.csv
+  #     3) wear_train.csv
+  #     4) wear_test.csv
+  #     5) paired_train.csv
+  #     6) paired_test.csv
+  # ----------------------------
+  datasets:
+
+    # ----------------------------
+    # A) Clean flow dataset (hydraulic_wear forced to 0)
+    # ----------------------------
+    - name: flow_clean
+      mode: clean                       # "clean" | "wear" | "paired"
+      wear_reference: 0.0               # used for clean mode
+      outputs:
+        train_filename: "{client_name}_flow_clean_train.csv"
+        test_filename:  "{client_name}_flow_clean_test.csv"
+
+    # ----------------------------
+    # B) Wear dataset (hydraulic_wear sampled per inputs.range)
+    # ----------------------------
+    - name: wear
+      mode: wear
+      outputs:
+        train_filename: "{client_name}_wear_train.csv"
+        test_filename:  "{client_name}_wear_test.csv"
+
+    # ----------------------------
+    # C) Paired dataset (same operating point, run twice)
+    #    - clean run (wear_reference)
+    #    - degraded run (sampled wear)
+    #    Exports q_liquid (degraded), q_liquid_clean, delta_q_liquid
+    # ----------------------------
+    - name: paired
+      mode: paired
+      wear_reference: 0.0
+      outputs:
+        train_filename: "{client_name}_paired_train.csv"
+        test_filename:  "{client_name}_paired_test.csv"
+
+# ----------------------------
+# Data schema (spreadsheet-friendly)
+#   inputs    = user-defined independent variables (ranges)
+#   variables = equation-derived outputs only
+# ----------------------------
 data:
-- name: suction_pressure
-  unit: bar
-- name: discharge_pressure
-  unit: bar
-- name: delta_pressure
-  unit: bar
-- name: speed
-  unit: rpm
-- name: temperature
-  unit: degC
-- name: fluid_density
-  unit: kg/m3
-- name: fluid_viscosity
-  unit: cP
-- name: q_liquid
-  unit: m3/h
-- name: hydraulic_wear
-  unit: frac
-- name: pump_power
-  unit: kW
-- name: valve_opening
-  unit: frac
-- name: sink_pressure
-  unit: bar
-- name: valve_size
-  unit: inches
 
-operating_ranges:
-  suction_pressure_range: [1, 3]
-  temperature_range: [15, 25]
-  speed_range: [1800, 1800]
-  density_range: [995, 1010]
-  viscosity_range: [0.8, 1.2]
-  k_friction_range: [0.005, 0.005]
+  # ----------------------------
+  # Model inputs (user units)
+  # ----------------------------
+  inputs:
+    - name: suction_pressure
+      unit: bar
+      range: [1, 3]
 
-  hydraulic_wear:
-    enabled: true
-    range: [0.0, 0.15]
+    - name: sink_pressure
+      unit: bar
+      range: [1.0, 5]
+      sampling:
+        method: mixture
+        components:
+          - type: uniform
+            weight: 0.7
+          - type: beta
+            weight: 0.15
+            a: 0.7
+            b: 3.5
+          - type: beta
+            weight: 0.15
+            a: 3.5
+            b: 0.7
 
+    - name: temperature
+      unit: degC
+      range: [15, 25]
+
+    - name: fluid_density
+      unit: kg/m3
+      range: [995, 1010]
+
+    - name: fluid_viscosity
+      unit: cP
+      range: [0.8, 1.2]
+
+    - name: speed
+      unit: rpm
+      range: [1750, 1810]
+
+    - name: valve_opening
+      unit: frac
+      range: [0.15, 0.99]
+      sampling:
+        method: mixture
+        components:
+          - type: uniform
+            weight: 0.6
+          - type: beta
+            weight: 0.2
+            a: 0.5
+            b: 4.0
+          - type: beta
+            weight: 0.2
+            a: 4.0
+            b: 0.5
+
+    # --- model / loss modifiers ---
+    - name: k_friction
+      unit: frac
+      range: [0.005, 0.005]
+
+    # NOTE:
+    #   hydraulic_wear is sampled ONLY for datasets with mode=wear or mode=paired
+    #   For mode=clean, generator should override hydraulic_wear to wear_reference.
+    - name: hydraulic_wear
+      unit: frac
+      range: [0.001, 0.15]
+
+  # ----------------------------
+  # Dataset variables (equation-derived outputs ONLY)
+  #   For non-paired datasets:
+  #     q_liquid is exported
+  #   For paired datasets:
+  #     q_liquid, q_liquid_clean, delta_q_liquid are exported
+  # ----------------------------
+  variables:
+    - name: discharge_pressure
+      unit: bar
+
+    - name: delta_pressure
+      unit: bar
+
+    - name: q_liquid
+      unit: m3/h
+
+    # Paired-only (safe to include; generator can write blank or omit unless mode=paired)
+    - name: q_liquid_clean
+      unit: m3/h
+
+    - name: delta_q_liquid
+      unit: m3/h
+
+    - name: pump_power
+      unit: kW
+
+# ----------------------------
+# Equipment parameterization
+# ----------------------------
+equipment_paramterization:
+
+  # ----------------------------
+  # Pump definition
+  # ----------------------------
   pump:
-    base_speed_rpm: 1800.0
+    base_speed_rpm: 1800
+
+    # Units for pump curves
+    curve_q_unit: m3/h
+    head_unit: m
+    efficiency_unit: pct
+
+    # Head curve: [Q, Head]
     curve_points:
       - [0, 60]
       - [30, 55]
       - [60, 45]
       - [90, 25]
       - [120, 10]
+
+    # Efficiency curve: [Q, efficiency_%]
     efficiency_curve_points:
       - [0, 0]
       - [30, 70]
       - [60, 78]
       - [90, 72]
       - [120, 55]
-    power_ref_density_kg_m3: 1000.0
 
+    # Reference density for power calculation
+    power_ref_density_kg_m3: 1000
+
+  # ----------------------------
+  # Valve definition
+  # ----------------------------
   valve:
     enabled: true
-    valve_size: 12
+    valve_size: 12.0
+    valve_size_unit: inches
+
     cv_flow_unit: m3/h
     cv_dp_unit: bar
+
+    curve_type: Cv
     cv_curve_points:
       - [0.0, 0.0]
       - [0.2, 20]
       - [0.5, 50]
       - [0.8, 90]
       - [1.0, 120]
-    valve_opening_range: [0.15, 0.75]
-    sink_pressure_range: [1.0, 5.0]
+
+    fp: 0.86
+    xt: 0
+
+# ----------------------------
+# Notes
+# ----------------------------
+notes:
+  structure_rationale: >
+    `inputs` represent independent user-controlled variables (set or sampled).
+    `variables` represent quantities computed by physics equations only.
+    This structure maps cleanly to spreadsheet workflows and ML schemas.
+  unit_philosophy: >
+    User units are defined here; all physics is executed in canonical SI units
+    and converted back for export.

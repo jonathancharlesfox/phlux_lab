@@ -6,44 +6,28 @@ import math
 
 G_STD = 9.80665
 
-# ============================================================
-# Hard-coded valve parameters (always applied)
-# ============================================================
-
-VALVE_FL = 0.9
-VALVE_XT = 0.7
-VALVE_FD = 0.48
-
-# Piping geometry factor (Fp) - reduces effective capacity slightly (K-Spice includes piping effects)
-VALVE_FP = 0.87
-
-# If you later want cavitation / vapor pressure effects, wire them here.
-VALVE_FF = 0.96
-VALVE_PV_PA = 0.0
-
 
 # ============================================================
-# 1D Natural Cubic Spline (no external deps)
+# Utility: Natural cubic spline (1D)
 # ============================================================
 
 class NaturalCubicSpline1D:
     """
-    Natural cubic spline interpolation for strictly increasing x.
+    Natural cubic spline interpolator with endpoint second-derivative = 0.
 
-    This mirrors K-Spice's "Spline" option closely enough for our use:
-      - smooth first/second derivatives
-      - natural boundary conditions (2nd derivative = 0 at endpoints)
-
-    Note: values are extrapolated linearly outside the data range (clamped slope).
+    We clamp outside the x-range to endpoints, which matches typical pump-curve usage.
     """
-
     def __init__(self, x: List[float], y: List[float]) -> None:
-        if len(x) != len(y) or len(x) < 2:
-            raise ValueError("Spline requires at least 2 points and matching x/y lengths.")
-        # Ensure strictly increasing
-        for i in range(len(x) - 1):
-            if not (x[i + 1] > x[i]):
-                raise ValueError("Spline x values must be strictly increasing.")
+        if len(x) != len(y):
+            raise ValueError("x and y must be same length")
+        if len(x) < 2:
+            raise ValueError("Need at least 2 points for spline")
+
+        # x must be strictly increasing
+        for i in range(1, len(x)):
+            if x[i] <= x[i - 1]:
+                raise ValueError("x must be strictly increasing")
+
         self.x = [float(v) for v in x]
         self.y = [float(v) for v in y]
         self._m = self._second_derivatives(self.x, self.y)
@@ -59,10 +43,11 @@ class NaturalCubicSpline1D:
         c = [0.0] * n
         d = [0.0] * n
 
+        # Natural spline boundary conditions
         b[0] = 1.0
         d[0] = 0.0
-        b[-1] = 1.0
-        d[-1] = 0.0
+        b[n - 1] = 1.0
+        d[n - 1] = 0.0
 
         for i in range(1, n - 1):
             a[i] = h[i - 1]
@@ -71,59 +56,61 @@ class NaturalCubicSpline1D:
             d[i] = 6.0 * ((y[i + 1] - y[i]) / h[i] - (y[i] - y[i - 1]) / h[i - 1])
 
         # Thomas algorithm
+        cp = [0.0] * n
+        dp = [0.0] * n
+
+        cp[0] = c[0] / b[0] if b[0] != 0 else 0.0
+        dp[0] = d[0] / b[0] if b[0] != 0 else 0.0
+
         for i in range(1, n):
-            w = a[i] / b[i - 1] if b[i - 1] != 0 else 0.0
-            b[i] = b[i] - w * c[i - 1]
-            d[i] = d[i] - w * d[i - 1]
+            denom = b[i] - a[i] * cp[i - 1]
+            if abs(denom) < 1e-18:
+                denom = 1e-18
+            cp[i] = c[i] / denom if i < n - 1 else 0.0
+            dp[i] = (d[i] - a[i] * dp[i - 1]) / denom
 
         m = [0.0] * n
-        m[-1] = d[-1] / b[-1] if b[-1] != 0 else 0.0
+        m[n - 1] = dp[n - 1]
         for i in range(n - 2, -1, -1):
-            m[i] = (d[i] - c[i] * m[i + 1]) / b[i] if b[i] != 0 else 0.0
+            m[i] = dp[i] - cp[i] * m[i + 1]
+
         return m
 
     def __call__(self, xq: float) -> float:
-        xq = float(xq)
-        x = self.x
-        y = self.y
-        m = self._m
+        # Clamp
+        if xq <= self.x[0]:
+            return float(self.y[0])
+        if xq >= self.x[-1]:
+            return float(self.y[-1])
 
-        if xq <= x[0]:
-            # linear extrapolation using first segment slope
-            dx = x[1] - x[0]
-            slope = (y[1] - y[0]) / dx if dx != 0 else 0.0
-            return y[0] + slope * (xq - x[0])
-        if xq >= x[-1]:
-            dx = x[-1] - x[-2]
-            slope = (y[-1] - y[-2]) / dx if dx != 0 else 0.0
-            return y[-1] + slope * (xq - x[-1])
-
-        # find interval
+        # Binary search interval
         lo = 0
-        hi = len(x) - 1
+        hi = len(self.x) - 1
         while hi - lo > 1:
-            mid = (lo + hi) // 2
-            if x[mid] <= xq:
+            mid = (hi + lo) // 2
+            if self.x[mid] <= xq:
                 lo = mid
             else:
                 hi = mid
 
         i = lo
-        h = x[i + 1] - x[i]
-        if h == 0:
-            return y[i]
+        h = self.x[i + 1] - self.x[i]
+        if h <= 0:
+            return float(self.y[i])
 
-        a = (x[i + 1] - xq) / h
-        b = (xq - x[i]) / h
-        return (
-            a * y[i]
-            + b * y[i + 1]
-            + ((a**3 - a) * m[i] + (b**3 - b) * m[i + 1]) * (h**2) / 6.0
+        A = (self.x[i + 1] - xq) / h
+        B = (xq - self.x[i]) / h
+
+        yq = (
+            A * self.y[i]
+            + B * self.y[i + 1]
+            + ((A**3 - A) * self._m[i] + (B**3 - B) * self._m[i + 1]) * (h**2) / 6.0
         )
+        return float(yq)
 
 
 # ============================================================
-# Pump curve (Head + optional Efficiency)
+# Pump curve model (head/eff vs Q with affinity laws)
 # ============================================================
 
 @dataclass
@@ -132,13 +119,19 @@ class PumpCurve:
     Pump curve points are (q_m3_s, head_m) at base_speed_rpm.
     Efficiency points are (q_m3_s, eff_frac) at base_speed_rpm.
 
-    K-Spice uses spline interpolation; we replicate that with NaturalCubicSpline1D.
+    Wear model:
+      - head reduced by (1 - wear)
+      - efficiency reduced by (1 - eff_sens * wear)
     """
     base_speed_rpm: float
     head_points: List[Tuple[float, float]]
     eff_points: Optional[List[Tuple[float, float]]] = None
+
     power_ref_density_kg_m3: float = 1000.0
-    hydraulic_wear_frac: float = 0.0  # 0..1, reduces head uniformly
+
+    hydraulic_wear_frac: float = 0.0  # 0..1
+    hydraulic_wear_eff_sensitivity: float = 0.7  # 0..1
+    hydraulic_wear_head_alpha: float = 1.0
 
     def __post_init__(self) -> None:
         self.head_points = sorted([(float(q), float(h)) for q, h in self.head_points], key=lambda t: t[0])
@@ -154,9 +147,10 @@ class PumpCurve:
             self._eff_spline = NaturalCubicSpline1D(qe, ee)
 
     def head_at(self, q_m3_s: float, speed_rpm: float) -> float:
-        # Affinity laws: Q ~ N, H ~ N^2
         if speed_rpm <= 0:
             return 0.0
+
+        # Affinity laws: Q ~ N, H ~ N^2
         n_ratio = float(speed_rpm) / float(self.base_speed_rpm)
         q_base = float(q_m3_s) / max(n_ratio, 1e-12)
 
@@ -164,19 +158,29 @@ class PumpCurve:
         head = head_base * (n_ratio ** 2)
 
         wear = max(0.0, min(1.0, float(self.hydraulic_wear_frac)))
-        return head * (1.0 - wear)
+
+        # fudge knob: alpha > 1 makes wear hit harder (K-Spice-like)
+        alpha = float(getattr(self, "hydraulic_wear_head_alpha", 1.0))  # default 1.0
+        return head * ((1.0 - wear) ** alpha)
 
     def efficiency_at(self, q_m3_s: float, speed_rpm: float) -> float:
         """
-        Returns efficiency as a fraction (0..1). If no efficiency curve exists, returns 1.0.
-        We use q scaling (Q ~ N) to map to base curve.
+        Returns hydraulic pump efficiency (0..1).
+        Vendor pump efficiency curves are hydraulic efficiency (hydraulic / shaft),
+        not motor electrical efficiency.
         """
         if self._eff_spline is None or speed_rpm <= 0:
             return 1.0
+
         n_ratio = float(speed_rpm) / float(self.base_speed_rpm)
         q_base = float(q_m3_s) / max(n_ratio, 1e-12)
-        eta = float(self._eff_spline(q_base))
-        # Clamp to sane values
+
+        eta_healthy = float(self._eff_spline(q_base))
+
+        wear = max(0.0, min(1.0, float(self.hydraulic_wear_frac)))
+        sens = max(0.0, min(1.0, float(self.hydraulic_wear_eff_sensitivity)))
+        eta = eta_healthy * (1.0 - sens * wear)
+
         return max(1e-6, min(1.0, eta))
 
 
@@ -185,7 +189,7 @@ def head_to_delta_p_pa(head_m: float, rho_kg_m3: float) -> float:
 
 
 # ============================================================
-# Valve model (capacity curve + Reynolds correction + FL cap)
+# Valve model (capacity curve + Reynolds correction)
 # ============================================================
 
 @dataclass
@@ -197,9 +201,21 @@ class ValveCvCurve:
         Q [m3/s]
         dP [Pa]
         K [ (m3/s)/sqrt(Pa) ]
+
+    Important: K(opening) here is a *base* capacity. Piping geometry factor Fp
+    (typically <= 1) is applied as a multiplier to the capacity:
+        K_eff = Fp * K
+    which increases dP for the same Q if Fp < 1. This aligns with common ISA/IEC
+    sizing where Fp reduces effective Cv due to fittings/reducers.
     """
     k_curve_points: List[Tuple[float, float]]
     nominal_diameter_m: float
+
+    # Optional sizing modifiers (defaults are conservative)
+    fp: float = 1.0  # piping geometry factor (<=1 reduces capacity)
+    xt: float = 0.7  # pressure recovery factor (used only for optional cap)
+    fl: float = 0.9  # liquid pressure recovery (not used directly yet)
+    fd: float = 0.48 # valve style modifier (not used directly yet)
 
     def __post_init__(self) -> None:
         self.k_curve_points = sorted([(float(o), float(k)) for o, k in self.k_curve_points], key=lambda t: t[0])
@@ -207,10 +223,20 @@ class ValveCvCurve:
         yk = [k for _, k in self.k_curve_points]
         self._k_spline = NaturalCubicSpline1D(xo, yk)
 
+        # Clamp fp to sane range
+        self.fp = float(self.fp)
+        if not (0.1 <= self.fp <= 2.0):
+            self.fp = 1.0
+
+        self.xt = max(0.0, min(1.0, float(self.xt)))
+
     def k_at_opening(self, opening_frac: float) -> float:
         op = max(0.0, min(1.0, float(opening_frac)))
         k = float(self._k_spline(op))
-        return max(k, 0.0)
+        k = max(k, 0.0)
+
+        # Apply piping factor to capacity
+        return k * float(self.fp)
 
     def _reynolds_number_liquid(self, q_m3_s: float, rho: float, mu_pa_s: float) -> float:
         D = max(float(self.nominal_diameter_m), 1e-6)
@@ -222,77 +248,97 @@ class ValveCvCurve:
 
     @staticmethod
     def _fr_factor_liquid(re: float) -> float:
+        # Mild Reynolds correction (you can replace with a stricter ISA form later)
         re = max(float(re), 1.0)
         if re >= 10000.0:
             return 1.0
+        fr_trans = 1.0 + (10_000.0 - re) / 10_000.0
+        fr_lam = 1.0 + (10_000.0 - re) / 2_000.0
+        return max(1.0, min(fr_lam, fr_trans))
 
-        fr_trans = 1.0 + 0.33 * math.sqrt(max(VALVE_FL, 1e-6)) * math.log10(re / 10000.0)
-        fr_trans = max(min(fr_trans, 1.0), 0.05)
-
-        fr_lam = 0.026 * math.sqrt(re) / math.sqrt(max(VALVE_FL, 1e-6))
-        fr_lam = max(min(fr_lam, 1.0), 0.02)
-
-        return min(fr_trans, fr_lam)
-
-    def delta_p_pa(
+    def valve_dp_pa(
         self,
         q_m3_s: float,
         opening_frac: float,
         rho_kg_m3: float,
         mu_pa_s: float,
-        p_upstream_pa: Optional[float] = None,
+        p_up_pa: float,
+        p_dn_pa: float,
     ) -> float:
-        K = self.k_at_opening(opening_frac)
-        if K <= 0:
-            return 1e30
+        q = float(q_m3_s)
+        op = max(0.0, min(1.0, float(opening_frac)))
+        rho = max(float(rho_kg_m3), 1e-9)
+        mu = max(float(mu_pa_s), 1e-12)
 
-        re = self._reynolds_number_liquid(q_m3_s=q_m3_s, rho=rho_kg_m3, mu_pa_s=mu_pa_s)
-        FR = self._fr_factor_liquid(re)
+        k_eff = self.k_at_opening(op)
+        if k_eff <= 1e-18:
+            return 0.0
 
-        K_eff = max(K * FR * VALVE_FP, 1e-18)
-        dp = (float(q_m3_s) / K_eff) ** 2
+        # Base dp from capacity curve
+        dp = (q / k_eff) ** 2  # Pa
 
-        if p_upstream_pa is not None:
-            dp_max = (VALVE_FL ** 2) * max(float(p_upstream_pa) - (VALVE_FF * VALVE_PV_PA), 0.0)
-            dp = min(dp, dp_max)
+        # Reynolds correction
+        re = self._reynolds_number_liquid(q, rho, mu)
+        fr = self._fr_factor_liquid(re)
+        dp *= fr
 
-        return float(dp)
+        # Optional "cap" for extreme recovery effects (usually irrelevant for liquid, moderate dP)
+        # Keep conservative and based on upstream absolute pressure.
+        p1 = max(float(p_up_pa), 0.0)
+        dp_cap = max(0.0, self.xt * p1)
+        if dp_cap > 0.0:
+            dp = min(dp, dp_cap)
+
+        return max(0.0, float(dp))
 
 
 # ============================================================
-# System curve / operating point
+# System curve (what generator expects)
 # ============================================================
 
 @dataclass
 class SystemCurve:
+    """
+    System-side requirements seen by the pump.
+
+    head_required = h_static + k_friction*q^2 + head_valve
+    """
     h_static_m: float
     k_friction: float
     density_kg_m3: float
     viscosity_pa_s: float
     suction_pressure_pa: float
-    valve: Optional[ValveCvCurve] = None
+    sink_pressure_pa: float
+    valve: Optional[ValveCvCurve]
     valve_opening: float = 1.0
 
-    def required_head_m(self, q_m3_s: float, head_pump_m: float) -> float:
-        rho = float(self.density_kg_m3)
-        mu = float(self.viscosity_pa_s)
-        q = float(q_m3_s)
+    def head_required_m(self, q_m3_s: float, dp_pump_pa: float) -> float:
+        rho = max(float(self.density_kg_m3), 1e-9)
+        mu = max(float(self.viscosity_pa_s), 1e-12)
 
-        h = float(self.h_static_m) + float(self.k_friction) * (q ** 2)
+        head_fric = float(self.k_friction) * (float(q_m3_s) ** 2)
 
+        p_up = float(self.suction_pressure_pa) + float(dp_pump_pa)
+        p_dn = float(self.sink_pressure_pa)
+
+        head_valve = 0.0
         if self.valve is not None:
-            p1 = float(self.suction_pressure_pa) + rho * G_STD * float(head_pump_m)
-            dp_v = self.valve.delta_p_pa(
-                q_m3_s=q,
+            dp_valve = self.valve.valve_dp_pa(
+                q_m3_s=float(q_m3_s),
                 opening_frac=float(self.valve_opening),
                 rho_kg_m3=rho,
                 mu_pa_s=mu,
-                p_upstream_pa=p1,
+                p_up_pa=p_up,
+                p_dn_pa=p_dn,
             )
-            h += dp_v / (rho * G_STD)
+            head_valve = dp_valve / (rho * G_STD)
 
-        return h
+        return float(self.h_static_m) + head_fric + head_valve
 
+
+# ============================================================
+# Operating point solver (what generator expects)
+# ============================================================
 
 def solve_operating_point(
     pump: PumpCurve,
@@ -300,37 +346,29 @@ def solve_operating_point(
     speed_rpm: float,
     q_min_m3_s: float,
     q_max_m3_s: float,
-    max_iter: int = 80,
+    n_steps: int = 2000,
 ) -> float:
     """
-    Solve H_pump(Q) = H_required(Q) using bisection.
+    Brute-force search for q where pump head matches system required head.
+    Returns q [m3/s] only (generator expects q only).
     """
-    q_lo = float(q_min_m3_s)
-    q_hi = float(q_max_m3_s)
+    best_q = float(q_min_m3_s)
+    best_err = float("inf")
 
-    def f(q: float) -> float:
-        Hp = pump.head_at(q, speed_rpm)
-        Hr = system.required_head_m(q, Hp)
-        return Hp - Hr
+    rho = max(float(system.density_kg_m3), 1e-9)
 
-    f_lo = f(q_lo)
-    f_hi = f(q_hi)
+    for i in range(n_steps + 1):
+        frac = i / max(n_steps, 1)
+        q = float(q_min_m3_s) + (float(q_max_m3_s) - float(q_min_m3_s)) * frac
 
-    if f_lo == 0.0:
-        return q_lo
-    if f_hi == 0.0:
-        return q_hi
-    if f_lo * f_hi > 0.0:
-        return q_lo if abs(f_lo) < abs(f_hi) else q_hi
+        head_pump = pump.head_at(q, speed_rpm)
+        dp_pump = head_to_delta_p_pa(head_pump, rho)
 
-    for _ in range(max_iter):
-        q_mid = 0.5 * (q_lo + q_hi)
-        f_mid = f(q_mid)
-        if abs(f_mid) < 1e-9:
-            return q_mid
-        if f_lo * f_mid <= 0.0:
-            q_hi, f_hi = q_mid, f_mid
-        else:
-            q_lo, f_lo = q_mid, f_mid
+        head_req = system.head_required_m(q_m3_s=q, dp_pump_pa=dp_pump)
 
-    return 0.5 * (q_lo + q_hi)
+        err = abs(head_pump - head_req)
+        if err < best_err:
+            best_err = err
+            best_q = q
+
+    return float(best_q)
