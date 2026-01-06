@@ -1,0 +1,284 @@
+
+training_config.yaml – Detailed Conceptual Reference
+===============================================
+
+This document explains every major concept used in the training_config.yaml file.
+It follows the YAML flow, but expands each section with *conceptual explanations*:
+what the setting means, why it exists, and how it affects model behavior.
+
+-------------------------------------------------
+GLOBAL SETTINGS
+-------------------------------------------------
+
+project_name
+  What it is:
+    A human-readable identifier for the modeling workflow or experiment.
+
+  Why it exists:
+    Used to group runs, label outputs, and make results traceable across experiments.
+    It has no effect on training behavior.
+
+client_name
+  What it is:
+    A logical namespace for datasets and trained models.
+
+  Why it exists:
+    Allows multiple assets or clients to be trained and evaluated independently
+    while using the same codebase.
+
+random_seed
+  What it is:
+    A seed for all stochastic processes.
+
+  Why it exists:
+    Ensures reproducibility of:
+      - synthetic sampling
+      - train/test splits
+      - model initialization
+    Without it, results can vary between runs.
+
+-------------------------------------------------
+AUTOLAB (AUTOMATED ITERATION LOOP)
+-------------------------------------------------
+
+autolab.enabled
+  What it is:
+    Master switch for the automated TRAIN → EVAL → TUNE loop.
+
+  How it works:
+    If enabled, the system:
+      1. Trains a model
+      2. Evaluates performance
+      3. Compares metrics to previous iterations
+      4. Optionally proposes configuration changes
+      5. Repeats until stopping criteria are met
+
+autolab.max_iters
+  What it is:
+    Upper bound on the number of iterations.
+
+  Why it exists:
+    Prevents runaway optimization loops and limits compute cost.
+
+autolab.regen_data
+  What it is:
+    Controls whether synthetic data is regenerated each iteration.
+
+  Why it matters:
+    - false: isolates model changes (recommended for tuning)
+    - true: explores robustness across regenerated datasets
+
+-------------------------------------------------
+AUTOLAB STOPPING CRITERIA
+-------------------------------------------------
+
+stop.metric
+  What it is:
+    The metric used to decide whether the model is improving.
+
+  Examples:
+    - mae_overall: average absolute error across all samples
+    - mae_by_bins: error computed per operating region
+
+stop.mode
+  What it is:
+    Direction of optimization.
+
+  Options:
+    - min: lower metric is better (typical for error)
+    - max: higher metric is better (e.g. R²)
+
+stop.min_improvement
+  What it is:
+    Minimum required improvement to count as progress.
+
+  Why it exists:
+    Prevents chasing noise-level improvements.
+
+stop.patience
+  What it is:
+    Number of non-improving iterations allowed before stopping.
+
+-------------------------------------------------
+AUTOLAB OBJECTIVES
+-------------------------------------------------
+
+Primary Objective
+-----------------
+
+autolab.objective.primary
+  What it is:
+    The single metric Autolab tries to optimize.
+
+  How it works:
+    - Only ONE primary objective is allowed
+    - All tuning decisions aim to improve this metric
+    - It defines what “better” means
+
+  Example:
+    Minimize MAE in high-flow regions rather than overall MAE.
+
+Secondary Objectives
+--------------------
+
+autolab.objective.secondary
+  What it is:
+    Constraints or guardrails applied during tuning.
+
+  How it differs from primary:
+    - Primary: optimization target
+    - Secondary: limits what is acceptable
+
+  Example:
+    - Keep bias below a threshold
+    - Prevent degradation of another stage
+
+-------------------------------------------------
+BINS AND BINNING (CORE CONCEPT)
+-------------------------------------------------
+
+What is a bin?
+  A bin is a numeric range of the target variable.
+
+Example:
+  Flow bins:
+    [0–20], [20–40], [40–60], [60–80], [80–120]
+
+Why bins exist:
+  - Error behavior is not uniform across operating space
+  - Some regions are more critical than others
+  - Binning exposes localized weaknesses hidden by global averages
+
+How bins are used:
+  - Evaluation: report MAE per bin
+  - Objectives: focus optimization on specific bins
+  - Sample weighting: emphasize certain bins during training
+
+-------------------------------------------------
+PREPROCESSING
+-------------------------------------------------
+
+Scaling
+-------
+
+scaling.method
+  What it is:
+    Normalization applied to input features.
+
+  Why it matters:
+    Improves numerical conditioning and training stability.
+
+Noise Injection
+---------------
+
+noise.enabled
+  What it is:
+    Adds small random perturbations to inputs during training.
+
+  Why it exists:
+    - Synthetic data is too “clean”
+    - Real sensors are noisy
+    - Noise improves generalization and robustness
+
+Important:
+  Noise is NEVER applied during evaluation or inference.
+
+-------------------------------------------------
+FEATURE ENGINEERING
+-------------------------------------------------
+
+What it is:
+  Creation of derived features using domain knowledge.
+
+Why it exists:
+  - Encodes known physical relationships
+  - Reduces learning burden on the neural network
+  - Improves convergence and stability
+
+Example:
+  delta_pressure = discharge_pressure − suction_pressure
+
+-------------------------------------------------
+MODELS (STAGES)
+-------------------------------------------------
+
+Each model stage is independent and sequential.
+
+Flow Model
+----------
+  Predicts flow rate directly from operating conditions.
+  Represents the “healthy” or baseline behavior.
+
+Wear Model
+----------
+  Predicts hydraulic degradation.
+  Explains deviations not attributable to boundary conditions.
+
+Flow Correction Model
+---------------------
+  Applies a learned correction to base flow predictions when wear is present.
+  Designed to be conservative and interpretable.
+
+-------------------------------------------------
+TARGET TRANSFORMS
+-------------------------------------------------
+
+transform.type
+  What it is:
+    Mathematical transform applied to the target during training.
+
+Why it exists:
+  - Stabilize gradients
+  - Improve resolution at low values
+  - Reduce bias toward mean predictions
+
+enable_wear_log1p
+  Special case for wear:
+    log1p(wear) improves sensitivity near zero wear.
+
+-------------------------------------------------
+CLIPPING
+-------------------------------------------------
+
+clip.enabled
+  What it is:
+    Enforces physical bounds on final predictions.
+
+Important:
+  - Applied AFTER inference
+  - Does NOT affect training or gradients
+
+Use case:
+  Prevent negative wear or flow predictions.
+
+-------------------------------------------------
+SAMPLE WEIGHTING
+-------------------------------------------------
+
+What it is:
+  Assigns higher importance to some samples during training.
+
+Why it exists:
+  - Some operating regions matter more
+  - Real systems spend more time in certain regimes
+
+How it works:
+  - Weight is computed per sample
+  - Passed to model.fit
+  - Evaluation metrics are NOT weighted
+
+Example:
+  Emphasize:
+    - low-wear accuracy
+    - high-flow regions
+    - safety-critical operating points
+
+-------------------------------------------------
+KEY DESIGN PHILOSOPHY
+-------------------------------------------------
+
+- Physics defines reality
+- ML learns mappings, not laws
+- Synthetic data is an approximation
+- Guardrails prevent silent failure
+- Healthy operation must dominate learning

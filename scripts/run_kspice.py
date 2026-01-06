@@ -10,6 +10,7 @@ from typing import Dict, List, Tuple, Any, Optional
 
 import numpy as np
 import yaml
+import pandas as pd
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
@@ -17,12 +18,25 @@ os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 # ============================================================
 # Paths
 # ============================================================
-LAB_ROOT = Path(__file__).resolve().parents[1]  # .../phlux_lab
+HERE = Path(__file__).resolve().parent              # .../phlux_lab/scripts
+LAB_ROOT = HERE.parent                              # .../phlux_lab
+REPO_ROOT = LAB_ROOT.parent                         # .../phlux
 TRAINING_CFG_PATH = LAB_ROOT / "configs" / "training_config.yaml"
 
 OUTPUT_DIR = LAB_ROOT / "outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 CSV_PATH = str(OUTPUT_DIR / "kspice_vs_ml.csv")
+
+
+def _resolve_path(p: str | Path) -> Path:
+    pp = Path(str(p)).expanduser()
+    if pp.is_absolute():
+        return pp
+    s = str(p).replace("\\", "/")
+    if s.startswith("phlux_lab/") or s.startswith("src/") or s.startswith("logs/"):
+        return (REPO_ROOT / s).resolve()
+    return (LAB_ROOT / s).resolve()
+
 
 # ============================================================
 # K-Spice API Setup
@@ -103,38 +117,87 @@ DEFAULT_USER_UNITS: Dict[str, str] = {
     "hydraulic_wear": "frac",
     "valve_dp": "bar",
     "delta_q_liquid": "m3/h",
-    # stacked / synthetic features that may appear in preprocessors:
+    # stacked / synthetic features that may appear:
     "q_liquid_pred": "m3/h",
     "flow_pred": "m3/h",
     "hydraulic_wear_pred": "frac",
     "wear_pred": "frac",
+    "specific_power": "",  # unit depends on your design; leave blank unless you suffix columns explicitly
 }
 
 # ============================================================
-# Training-config reader
+# Training-config reader (master truth)
 # ============================================================
-def load_training_config_multi() -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+def load_training_config_multi() -> Tuple[Dict[str, Any], str, Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     with open(TRAINING_CFG_PATH, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
 
-    client_name = str(cfg.get("client_name", "")).strip()
+    project = cfg.get("project", {}) or {}
+    client_name = str(cfg.get("client_name") or project.get("client_name") or project.get("client") or "").strip()
+
     if not client_name:
-        models_root = LAB_ROOT / "models"
-        clients = [d.name for d in models_root.iterdir() if d.is_dir()]
-        if len(clients) == 1:
-            client_name = clients[0]
-            print(f"ℹ️ Inferred client_name='{client_name}' from models directory")
+        # try inferring from model root directory if unambiguous
+        base = cfg.get("paths", {}).get("model_root", str(LAB_ROOT / "models"))
+        base = str(base).replace("{client}", "").replace("{client_name}", "")
+        models_root = _resolve_path(base)
+        if models_root.exists() and models_root.is_dir():
+            clients = [d.name for d in models_root.iterdir() if d.is_dir()]
+            if len(clients) == 1:
+                client_name = clients[0]
+                print(f"ℹ️ Inferred client_name='{client_name}' from models directory")
+            else:
+                raise KeyError(
+                    "training_config.yaml must define project.client_name (or client_name) when multiple client model directories exist"
+                )
         else:
-            raise KeyError(
-                "training_config.yaml must define 'client_name:' when multiple client model directories exist"
-            )
+            raise KeyError("training_config.yaml must define project.client_name (or client_name)")
 
     training_defaults = cfg.get("training_defaults", {}) or {}
     stages_cfg = cfg.get("models", {}) or {}
     if not isinstance(stages_cfg, dict) or not stages_cfg:
         raise KeyError("training_config.yaml must define 'models:' with stage blocks")
 
-    return client_name, training_defaults, stages_cfg
+    preprocessing = cfg.get("preprocessing", {}) or {}
+    return cfg, client_name, training_defaults, stages_cfg, preprocessing
+
+
+def _canonical_client_dir(cfg: Dict[str, Any], client: str) -> Path:
+    raw = str((cfg.get("paths", {}) or {}).get("model_root", str(LAB_ROOT / "models")))
+    raw = raw.replace("{client}", client).replace("{client_name}", client)
+    base = _resolve_path(raw)
+    if base.name.lower() == client.lower():
+        return base
+    return base / client
+
+
+def _merge_model_cfg(global_cfg: Dict[str, Any], stage_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    defaults = dict(global_cfg.get("training_defaults", {}) or {})
+    stage_model = dict(stage_cfg.get("model", {}) or {})
+
+    merged: Dict[str, Any] = {}
+    merged.update(defaults)
+    merged.update(stage_model)
+
+    if "early_stopping" in merged and "earlystop" not in merged:
+        merged["earlystop"] = bool(merged["early_stopping"])
+    if "patience" in merged and "earlystop_patience" not in merged:
+        merged["earlystop_patience"] = int(merged["patience"])
+    if "validation_split" in merged and "val_split" not in merged:
+        merged["val_split"] = float(merged["validation_split"])
+
+    rlr = dict(global_cfg.get("reduce_lr_on_plateau", {}) or {})
+    if bool(rlr.get("enabled", False)) and "lr_scheduler_cfg" not in merged:
+        merged["lr_scheduler_cfg"] = {
+            "type": "reduce_lr_on_plateau",
+            "monitor": rlr.get("monitor", "val_loss"),
+            "factor": rlr.get("factor", 0.5),
+            "patience": rlr.get("patience", 3),
+            "min_lr": rlr.get("min_lr", 1e-5),
+            "cooldown": rlr.get("cooldown", 0),
+            "verbose": rlr.get("verbose", 1),
+        }
+    return merged
+
 
 # ============================================================
 # Feature mapping helpers
@@ -142,14 +205,17 @@ def load_training_config_multi() -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
 def _col_unit_suffix(col: str) -> str:
     return col.split("__", 1)[1] if "__" in col else ""
 
+
 def _internal_name(col: str) -> str:
     return col.split("__", 1)[0] if "__" in col else col
+
 
 def _resolved_unit(col: str) -> str:
     suf = _col_unit_suffix(col)
     if suf:
         return suf
     return DEFAULT_USER_UNITS.get(_internal_name(col), "")
+
 
 def _user_value_for_col(
     col: str,
@@ -167,12 +233,15 @@ def _user_value_for_col(
     unit = _resolved_unit(col) or ""
     c = _internal_name(col).lower()
 
-    # Stacked features must be provided via extra_values
+    # IMPORTANT:
+    # We do NOT build stacked or engineered features here.
+    # Those get injected later in this script.
     if c.endswith("_pred") or c in {"q_liquid_pred", "flow_pred", "hydraulic_wear_pred", "wear_pred"}:
         raise RuntimeError(
-            f"Unhandled input feature column: '{col}' (stacked feature). "
-            "This must be provided via extra_values when building feature_inputs."
+            f"'{col}' is a stacked feature and must be injected (computed from upstream models)."
         )
+    if c == "specific_power":
+        raise RuntimeError("'specific_power' is engineered and must be injected/derived after q_liquid_pred exists.")
 
     if "suction" in c and "pressure" in c:
         return float(convert_internal_back_to_user(ks_p_in_pa, unit or "Pa"))
@@ -207,18 +276,14 @@ def _user_value_for_col(
     if "pump_power" in c or ("power" in c and "pump" in c):
         return float(convert_internal_back_to_user(ks_pwr_w, unit or "W"))
 
-    if c.startswith("head_proxy"):
-        dp_bar = float(convert_internal_back_to_user(ks_p_out_pa - ks_p_in_pa, "bar"))
-        dens = float(convert_internal_back_to_user(density_kg_m3, "kg/m3"))
-        return dp_bar / max(dens, 1e-12)
-
     if "valve_dp" in c:
         dp_pa = ks_p_out_pa - ks_p_sink_pa
         return float(convert_internal_back_to_user(dp_pa, unit or "Pa"))
 
     raise RuntimeError(f"Unhandled input feature column: '{col}'")
 
-def build_feature_inputs_for_predictor(
+
+def build_feature_inputs_for_cols(
     cols: List[str],
     *,
     ks_p_in_pa: float,
@@ -230,95 +295,133 @@ def build_feature_inputs_for_predictor(
     density_kg_m3: float,
     viscosity_pa_s: float,
     valve_opening_frac: float,
-    extra_values: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     out: Dict[str, float] = {}
-    extras = extra_values or {}
-
     for col in cols:
-        if col in extras:
-            out[col] = float(extras[col])
-            continue
-
-        val = _user_value_for_col(
-            col,
-            ks_p_in_pa=ks_p_in_pa,
-            ks_p_out_pa=ks_p_out_pa,
-            ks_p_sink_pa=ks_p_sink_pa,
-            ks_t_in_k=ks_t_in_k,
-            ks_pwr_w=ks_pwr_w,
-            speed_rpm=speed_rpm,
-            density_kg_m3=density_kg_m3,
-            viscosity_pa_s=viscosity_pa_s,
-            valve_opening_frac=valve_opening_frac,
+        out[col] = float(
+            _user_value_for_col(
+                col,
+                ks_p_in_pa=ks_p_in_pa,
+                ks_p_out_pa=ks_p_out_pa,
+                ks_p_sink_pa=ks_p_sink_pa,
+                ks_t_in_k=ks_t_in_k,
+                ks_pwr_w=ks_pwr_w,
+                speed_rpm=speed_rpm,
+                density_kg_m3=density_kg_m3,
+                viscosity_pa_s=viscosity_pa_s,
+                valve_opening_frac=valve_opening_frac,
+            )
         )
-        out[col] = float(val)
-
-    # Allow extra values beyond cols (predictor may compute derived features)
-    for k, v in extras.items():
-        if k not in out:
-            out[k] = float(v)
-
     return out
 
-def _pick_first_numeric(pred: Dict[str, Any], preferred: List[str]) -> Optional[str]:
-    for k in preferred:
-        if k in pred and isinstance(pred.get(k), (int, float)):
-            return k
-    for k, v in pred.items():
-        if isinstance(v, (int, float)):
-            return k
-    return None
 
 # ============================================================
-# Load predictors
+# ML artifact loading (do NOT rely on VFMPredictor for stacking here)
 # ============================================================
 USE_ML_MODEL = True
-CLIENT_NAME, TRAINING_DEFAULTS, STAGES_CFG = load_training_config_multi()
+
+MASTER_CFG, CLIENT_NAME, TRAINING_DEFAULTS, STAGES_CFG, PREPROCESSING_CFG = load_training_config_multi()
+CLIENT_DIR = _canonical_client_dir(MASTER_CFG, CLIENT_NAME)
 
 try:
-    from phlux_lab.utils.predictor import VfmPredictor  # type: ignore
+    from phlux_lab.utils.preprocessor import Preprocessor  # type: ignore
+    from phlux_lab.ml.vfm_model import VFMModel  # type: ignore
 except Exception as e:
-    print(f"⚠️ Could not import VfmPredictor: {e}")
+    print(f"⚠️ Could not import ML stack: {e}")
     USE_ML_MODEL = False
-    VfmPredictor = None  # type: ignore
 
-def _stage_paths(client: str, stage: str) -> Tuple[Path, Path]:
-    stage_dir = LAB_ROOT / "models" / client / stage
-    model_path = stage_dir / f"vfm_{stage}.keras"
-    pp_path = stage_dir / f"preprocessor_{stage}.joblib"
-    return model_path, pp_path
+flow_model = wear_model = corr_model = None
+flow_pp = wear_pp = corr_pp = None
+RAW_INPUT_COLS: List[str] = []
 
-def _load_stage_predictor(stage: str) -> Optional[Any]:
-    if not USE_ML_MODEL or VfmPredictor is None:
-        return None
-    model_path, pp_path = _stage_paths(CLIENT_NAME, stage)
-    if not model_path.exists() or not pp_path.exists():
-        print(f"⚠️ Stage '{stage}' artifacts not found:")
-        print(f"   - model: {model_path}")
-        print(f"   - pp:    {pp_path}")
-        return None
-    p = VfmPredictor.from_paths(model_path=str(model_path), preprocessor_path=str(pp_path))
-    print(f"✅ Loaded '{stage}' predictor:")
-    print(f"   - model: {model_path}")
-    print(f"   - pp:    {pp_path}")
-    return p
 
-predictor_flow = _load_stage_predictor("flow")
-predictor_wear = _load_stage_predictor("wear")
-predictor_corr = _load_stage_predictor("flow_correction")
+def _stage_artifact_paths(client_dir: Path, stage: str) -> Tuple[Path, Path]:
+    stage_cfg = STAGES_CFG.get(stage, {}) or {}
+    save_cfg = stage_cfg.get("save", {}) or {}
+    model_name = save_cfg.get("model_name") or f"{stage}.keras"
+    pp_name = save_cfg.get("preprocessor") or f"preprocessor_{stage}.joblib"
+    stage_dir = client_dir / stage
+    return stage_dir / model_name, stage_dir / pp_name
 
-def _predict_any(predictor: Any, features: Dict[str, float]) -> Dict[str, float]:
-    if predictor is None:
-        return {}
-    if hasattr(predictor, "predict_one"):
-        return predictor.predict_one(features)
-    if hasattr(predictor, "predict_batch"):
-        out = predictor.predict_batch([features])
-        if isinstance(out, list) and out:
-            return out[0]
-        raise TypeError("predict_batch returned unexpected output")
-    raise AttributeError("VfmPredictor has no predict_one or predict_batch method")
+
+def _load_stage(stage: str) -> Tuple[Any, Any]:
+    model_path, pp_path = _stage_artifact_paths(CLIENT_DIR, stage)
+    if not model_path.exists():
+        raise FileNotFoundError(f"Missing model for stage '{stage}': {model_path}")
+    if not pp_path.exists():
+        raise FileNotFoundError(f"Missing preprocessor for stage '{stage}': {pp_path}")
+    pp_obj = Preprocessor.load(str(pp_path))
+    model_cfg = _merge_model_cfg(MASTER_CFG, STAGES_CFG.get(stage, {}) or {})
+    mdl = VFMModel.load(model_path=model_path, preprocessor=pp_obj, model_cfg=model_cfg)
+    return mdl, pp_obj
+
+
+def _predict_in_units(mdl: Any, df: pd.DataFrame) -> np.ndarray:
+    if hasattr(mdl, "predict_in_units"):
+        out = mdl.predict_in_units(df)
+        return np.asarray(out)
+    # fallback if needed
+    X = mdl.preprocessor.transform_X(df)
+    y_scaled = mdl.predict(X)
+    return mdl.preprocessor.inverse_transform_y(y_scaled)
+
+
+def _set_feature_with_possible_suffix(df: pd.DataFrame, feature_base: str, value: float, required_cols: List[str]) -> None:
+    """
+    If the preprocessor expects 'feature_base__unit', set that exact column.
+    Always also set the plain 'feature_base' (harmless, and useful for debugging).
+    """
+    df[feature_base] = float(value)
+    for c in required_cols:
+        if _internal_name(c) == feature_base:
+            df[c] = float(value)
+
+
+def _compute_specific_power(pump_power_col: str, q_col: str, df: pd.DataFrame) -> float:
+    """
+    specific_power = pump_power / q
+    Assumes df already has both values in the SAME units the model was trained on.
+    """
+    p = float(df[pump_power_col].iloc[0])
+    q = float(df[q_col].iloc[0])
+    if abs(q) < 1e-12:
+        return float("nan")
+    return p / q
+
+
+if USE_ML_MODEL:
+    try:
+        flow_model, flow_pp = _load_stage("flow")
+        wear_model, wear_pp = _load_stage("wear")
+        corr_model, corr_pp = _load_stage("flow_correction")
+
+        print("✅ Loaded models (direct stage calls in run_kspice):")
+        print(f"  - flow: {CLIENT_DIR / 'flow'}")
+        print(f"  - wear: {CLIENT_DIR / 'wear'}")
+        print(f"  - corr: {CLIENT_DIR / 'flow_correction'}")
+
+        # Build RAW_INPUT_COLS from union of (flow + wear) required inputs
+        # EXCLUDING:
+        #   - stacked preds (q_liquid_pred, hydraulic_wear_pred)
+        #   - engineered features we will compute AFTER flow (specific_power)
+        cols_flow = flow_pp.get_input_feature_names()
+        cols_wear = wear_pp.get_input_feature_names()
+
+        raw: List[str] = []
+        for c in list(cols_flow) + list(cols_wear):
+            base = _internal_name(c).lower()
+            if base.endswith("_pred") or base in {"q_liquid_pred", "hydraulic_wear_pred"}:
+                continue
+            if base == "specific_power":
+                continue
+            raw.append(c)
+
+        RAW_INPUT_COLS = list(dict.fromkeys(raw))
+
+    except Exception as e:
+        print(f"⚠️ Disabling ML due to load error: {e}")
+        USE_ML_MODEL = False
+
 
 # ============================================================
 # Sampling controls (internal SI for K-Spice boundaries)
@@ -330,7 +433,7 @@ P_SINK_RANGE_PA = (2.5e5, 5.0e5)
 T_IN_RANGE_K = (288.15, 298.15)  # 15–25 °C
 VALVE_OPENING_RANGE_FRAC = (0.25, 0.5)
 
-HYDRAULIC_WEAR_RANGE = (0.001, 0.15)
+HYDRAULIC_WEAR_RANGE = (0.01, 0.01)
 DEFAULT_SPEED_RPM = 1800.0
 
 # ============================================================
@@ -362,9 +465,7 @@ for i in range(N_CASES):
     tl.set_value(APP, TAG_P_IN, float(p_in))
     tl.set_value(APP, TAG_T_IN, float(t_in))
     tl.set_value(APP, TAG_P_SINK, float(p_sink))
-
     tl.set_value(APP, TAG_HYDRAULIC_WEAR, float(hydraulic_wear_frac))
-
     if TAG_VALVE_OPENING:
         tl.set_value(APP, TAG_VALVE_OPENING, float(valve_opening_frac))
 
@@ -382,10 +483,9 @@ for i in range(N_CASES):
     ks_p_out_pa = out[TAG_P_OUT_MEAS]
     ks_flow_m3s = out[TAG_FLOW_MEAS]
     ks_pwr_w = out[TAG_PWR_MEAS]
-
     ks_p_sink_pa = out[TAG_P_SINK_MEAS] if READ_SINK_MEAS else float(p_sink)
-    speed_rpm = float(DEFAULT_SPEED_RPM)
 
+    speed_rpm = float(DEFAULT_SPEED_RPM)
     density_kg_m3 = out[TAG_DENSITY_KG_M3]
     viscosity_pa_s = out[TAG_VISCOSITY_PA_S]
 
@@ -397,97 +497,30 @@ for i in range(N_CASES):
     ks_t_c = float(convert_internal_back_to_user(ks_t_in_k, "degC"))
     ks_pwr_kw = float(convert_internal_back_to_user(ks_pwr_w, "kW"))
     ks_flow_m3h = float(convert_internal_back_to_user(ks_flow_m3s, "m3/h"))
+
     speed_csv = float(convert_internal_back_to_user(speed_rpm, "rpm"))
     dens_csv = float(convert_internal_back_to_user(density_kg_m3, "kg/m3"))
     visc_csv_cp = float(viscosity_pa_s * 1000.0)
 
     # ============================================================
-    # ML: stage 1 (flow)
+    # ML predictions (manual stacked execution)
     # ============================================================
     ml_flow_pred_m3h = float("nan")
-    flow_err_pct = float("nan")
-
-    if predictor_flow is not None:
-        cols_for_model = predictor_flow.input_cols if getattr(predictor_flow, "input_cols", None) else []
-        if not cols_for_model:
-            raise RuntimeError("flow predictor has no input_cols; cannot build inputs.")
-
-        feature_inputs = build_feature_inputs_for_predictor(
-            cols_for_model,
-            ks_p_in_pa=ks_p_in_pa,
-            ks_p_out_pa=ks_p_out_pa,
-            ks_p_sink_pa=ks_p_sink_pa,
-            ks_t_in_k=ks_t_in_k,
-            ks_pwr_w=ks_pwr_w,
-            speed_rpm=speed_rpm,
-            density_kg_m3=density_kg_m3,
-            viscosity_pa_s=viscosity_pa_s,
-            valve_opening_frac=valve_opening_frac,
-        )
-
-        pred = _predict_any(predictor_flow, feature_inputs)
-        flow_key = _pick_first_numeric(pred, preferred=["q_liquid", "flow"])
-        if flow_key is not None:
-            ml_flow_pred_m3h = float(pred[flow_key])
-
-        if np.isfinite(ml_flow_pred_m3h) and abs(ks_flow_m3h) > 1e-9:
-            flow_err_pct = 100.0 * abs(ml_flow_pred_m3h - ks_flow_m3h) / abs(ks_flow_m3h)
-
-    # ============================================================
-    # ML: stage 2 (wear)  <-- FIX: pass q_liquid_pred if required
-    # ============================================================
     ml_wear_pred_frac = float("nan")
-    if predictor_wear is not None:
-        cols_for_model = predictor_wear.input_cols if getattr(predictor_wear, "input_cols", None) else []
-        if not cols_for_model:
-            raise RuntimeError("wear predictor has no input_cols; cannot build inputs.")
-
-        wear_extra: Dict[str, float] = {}
-        if np.isfinite(ml_flow_pred_m3h):
-            wear_extra["q_liquid_pred"] = float(ml_flow_pred_m3h)
-            wear_extra["flow_pred"] = float(ml_flow_pred_m3h)
-
-        feature_inputs = build_feature_inputs_for_predictor(
-            cols_for_model,
-            ks_p_in_pa=ks_p_in_pa,
-            ks_p_out_pa=ks_p_out_pa,
-            ks_p_sink_pa=ks_p_sink_pa,
-            ks_t_in_k=ks_t_in_k,
-            ks_pwr_w=ks_pwr_w,
-            speed_rpm=speed_rpm,
-            density_kg_m3=density_kg_m3,
-            viscosity_pa_s=viscosity_pa_s,
-            valve_opening_frac=valve_opening_frac,
-            extra_values=wear_extra if wear_extra else None,
-        )
-
-        pred = _predict_any(predictor_wear, feature_inputs)
-        wear_key = _pick_first_numeric(pred, preferred=["hydraulic_wear", "wear"])
-        if wear_key is not None:
-            ml_wear_pred_frac = float(pred[wear_key])
-
-    # ============================================================
-    # ML: stage 3 (flow_correction)
-    # ============================================================
-    ml_corr_delta_m3h = float("nan")
     ml_flow_corrected_m3h = float("nan")
+    ml_corr_delta_m3h = float("nan")
+
+    flow_err_pct = float("nan")
+    wear_err_pct = float("nan")
     corr_err_pct = float("nan")
 
-    if predictor_corr is not None:
-        cols_for_model = predictor_corr.input_cols if getattr(predictor_corr, "input_cols", None) else []
-        if not cols_for_model:
-            raise RuntimeError("flow_correction predictor has no input_cols; cannot build inputs.")
+    if USE_ML_MODEL and flow_model is not None and wear_model is not None and corr_model is not None:
+        if not RAW_INPUT_COLS:
+            raise RuntimeError("RAW_INPUT_COLS empty; cannot build inference row.")
 
-        extra: Dict[str, float] = {}
-        if np.isfinite(ml_flow_pred_m3h):
-            extra["q_liquid_pred"] = float(ml_flow_pred_m3h)
-            extra["flow_pred"] = float(ml_flow_pred_m3h)
-        if np.isfinite(ml_wear_pred_frac):
-            extra["hydraulic_wear_pred"] = float(ml_wear_pred_frac)
-            extra["wear_pred"] = float(ml_wear_pred_frac)
-
-        feature_inputs = build_feature_inputs_for_predictor(
-            cols_for_model,
+        # base raw inputs (no stacked, no engineered)
+        feature_inputs = build_feature_inputs_for_cols(
+            RAW_INPUT_COLS,
             ks_p_in_pa=ks_p_in_pa,
             ks_p_out_pa=ks_p_out_pa,
             ks_p_sink_pa=ks_p_sink_pa,
@@ -497,27 +530,77 @@ for i in range(N_CASES):
             density_kg_m3=density_kg_m3,
             viscosity_pa_s=viscosity_pa_s,
             valve_opening_frac=valve_opening_frac,
-            extra_values=extra if extra else None,
         )
+        df_base = pd.DataFrame([feature_inputs])
 
-        pred = _predict_any(predictor_corr, feature_inputs)
+        # -------------------------
+        # 1) FLOW
+        # -------------------------
+        q_flow = _predict_in_units(flow_model, df_base)
+        q_flow_scalar = float(q_flow.reshape(-1)[0])
+        ml_flow_pred_m3h = q_flow_scalar
 
-        if "delta_q_liquid" in pred and isinstance(pred.get("delta_q_liquid"), (int, float)):
-            ml_corr_delta_m3h = float(pred["delta_q_liquid"])
-            if np.isfinite(ml_flow_pred_m3h):
-                ml_flow_corrected_m3h = float(ml_flow_pred_m3h + ml_corr_delta_m3h)
+        # -------------------------
+        # 2) WEAR (inject q_liquid_pred + specific_power)
+        # -------------------------
+        df_wear = df_base.copy()
+        wear_required = wear_pp.get_input_feature_names()
 
-        if not np.isfinite(ml_flow_corrected_m3h):
-            k = _pick_first_numeric(pred, preferred=["q_liquid", "flow"])
-            if k is not None:
-                ml_flow_corrected_m3h = float(pred[k])
+        # inject q_liquid_pred (with or without unit suffix)
+        _set_feature_with_possible_suffix(df_wear, "q_liquid_pred", ml_flow_pred_m3h, wear_required)
+
+        # compute specific_power if required by wear
+        if any(_internal_name(c) == "specific_power" for c in wear_required):
+            # choose pump_power column name that exists in df_wear (with suffix, if present)
+            pump_power_candidates = [c for c in df_wear.columns if _internal_name(c) == "pump_power"]
+            q_candidates = [c for c in df_wear.columns if _internal_name(c) == "q_liquid_pred"]
+
+            if not pump_power_candidates:
+                raise RuntimeError("Cannot compute specific_power: pump_power column not present in df_wear.")
+            if not q_candidates:
+                raise RuntimeError("Cannot compute specific_power: q_liquid_pred column not present in df_wear.")
+
+            sp = _compute_specific_power(pump_power_candidates[0], q_candidates[0], df_wear)
+            _set_feature_with_possible_suffix(df_wear, "specific_power", sp, wear_required)
+
+        wear_out = _predict_in_units(wear_model, df_wear)
+        wear_scalar = float(wear_out.reshape(-1)[0])
+        ml_wear_pred_frac = wear_scalar
+
+        # -------------------------
+        # 3) CORRECTION (inject both preds + specific_power if needed)
+        # -------------------------
+        df_corr = df_base.copy()
+        corr_required = corr_pp.get_input_feature_names()
+
+        _set_feature_with_possible_suffix(df_corr, "q_liquid_pred", ml_flow_pred_m3h, corr_required)
+        _set_feature_with_possible_suffix(df_corr, "hydraulic_wear_pred", ml_wear_pred_frac, corr_required)
+
+        if any(_internal_name(c) == "specific_power" for c in corr_required):
+            pump_power_candidates = [c for c in df_corr.columns if _internal_name(c) == "pump_power"]
+            q_candidates = [c for c in df_corr.columns if _internal_name(c) == "q_liquid_pred"]
+            if not pump_power_candidates or not q_candidates:
+                raise RuntimeError("Cannot compute specific_power for correction: missing pump_power or q_liquid_pred.")
+            sp = _compute_specific_power(pump_power_candidates[0], q_candidates[0], df_corr)
+            _set_feature_with_possible_suffix(df_corr, "specific_power", sp, corr_required)
+
+        corr_out = _predict_in_units(corr_model, df_corr)
+        corr_scalar = float(corr_out.reshape(-1)[0])
+        ml_flow_corrected_m3h = corr_scalar
+
+        if np.isfinite(ml_flow_corrected_m3h) and np.isfinite(ml_flow_pred_m3h):
+            ml_corr_delta_m3h = float(ml_flow_corrected_m3h - ml_flow_pred_m3h)
+
+        # Errors vs K-Spice flow
+        if np.isfinite(ml_flow_pred_m3h) and abs(ks_flow_m3h) > 1e-9:
+            flow_err_pct = 100.0 * abs(ml_flow_pred_m3h - ks_flow_m3h) / abs(ks_flow_m3h)
 
         if np.isfinite(ml_flow_corrected_m3h) and abs(ks_flow_m3h) > 1e-9:
             corr_err_pct = 100.0 * abs(ml_flow_corrected_m3h - ks_flow_m3h) / abs(ks_flow_m3h)
 
-        if np.isfinite(ml_wear_pred_frac) and abs(hydraulic_wear_frac) > 1e-9:
+        if np.isfinite(ml_wear_pred_frac) and abs(hydraulic_wear_frac) > 1e-12:
             wear_err_pct = 100.0 * abs(ml_wear_pred_frac - hydraulic_wear_frac) / abs(hydraulic_wear_frac)
-    
+
     rows.append([
         ks_p_in_bar,
         ks_t_c,
@@ -544,20 +627,20 @@ for i in range(N_CASES):
 # Save CSV
 # ============================================================
 header = [
-    "ks_p_in__bar",
-    "ks_t_in__degC",
-    "ks_discharge_p__bar",
-    "ks_sink_p__bar",
-    "ks_dp__bar",
+    "virplant_p_in__bar",
+    "virplant_t_in__degC",
+    "virplant_discharge_p__bar",
+    "virplant_sink_p__bar",
+    "virplant_dp__bar",
     "speed__rpm",
     "fluid_density__kg/m3",
     "fluid_viscosity__cP",
-    "ks_pump_power__kW",
+    "virplant_pump_power__kW",
     "valve_opening__frac",
-    "kspice_wear_input__frac", 
+    "virplant_wear_input__frac",
     "ml_wear_pred__frac",
     "wear_err_pct",
-    "ks_flow__m3_h",
+    "virplant_flow__m3_h",
     "ml_flow_pred__m3_h",
     "flow_abs_error__pct",
     "ml_corr_delta__m3_h",

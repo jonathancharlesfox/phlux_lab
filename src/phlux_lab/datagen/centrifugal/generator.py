@@ -77,7 +77,16 @@ class CentrifugalPumpDatasetGenerator:
             str(d["name"]): d for d in self.inputs_cfg if "name" in d
         }
 
-        # Validate required inputs exist
+        
+        # 'discharge_pressure' is an equation-derived variable (computed from pump head).
+        # It must NOT be sampled as an input. Keep it under data.variables in the YAML.
+        if "discharge_pressure" in self._inputs_by_name:
+            raise ValueError(
+                "Config error: 'discharge_pressure' must be defined under data.variables (equation-derived), "
+                "not under data.inputs (sampled)."
+            )
+
+# Validate required inputs exist
         for req in (
             "suction_pressure",
             "sink_pressure",

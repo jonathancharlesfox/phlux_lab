@@ -1,90 +1,82 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional
+import math
 
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
-from phlux_lab.utils.units import convert_user_to_internal_SI
 
+# =============================================================================
+# Path resolving helpers
+# =============================================================================
 
-def _resolve_repo_path(p: str) -> str:
+def _resolve_repo_path(raw: str) -> str:
     """
-    Resolve repo-relative paths robustly for this project structure:
-      F:\\phlux\\phlux_lab\\src\\phlux_lab\\utils\\preprocessor.py
-
-    If YAML provides paths like 'phlux_lab/data/...', we resolve relative to repo root (F:\\phlux).
-    Otherwise, we try:
-      - as-is (cwd relative)
-      - repo root join
-      - lab root join
+    Resolve a repo-relative path string into an absolute path string.
+    Assumptions match your project layout:
+      repo_root/
+        phlux_lab/
+          configs/
+          data/
+          scripts/
+          src/
+    This file lives in: phlux_lab/src/phlux_lab/utils/preprocessor.py
     """
-    raw = (p or "").strip()
-    if not raw:
-        return raw
+    p = Path(str(raw)).expanduser()
 
-    pp = Path(raw)
-    if pp.is_absolute():
-        return str(pp)
+    # If already absolute, just return
+    if p.is_absolute():
+        return str(p)
 
-    # Infer roots from this file location
+    # repo_root = .../phlux (two levels up from phlux_lab)
     this_file = Path(__file__).resolve()
-    # .../phlux_lab/src/phlux_lab/utils/preprocessor.py
-    repo_root = this_file.parents[4]  # F:\phlux
-    lab_root = this_file.parents[3]  # F:\phlux\phlux_lab
+    lab_root = this_file.parents[3]  # .../phlux/phlux_lab
+    repo_root = lab_root.parent      # .../phlux
 
-    # normalize slashes for Windows
-    norm = raw.replace("\\", "/")
+    s = str(raw).replace("\\", "/")
 
-    # If YAML already includes 'phlux_lab/...', treat as repo-relative
-    if norm.startswith("phlux_lab/"):
-        cand = (repo_root / norm).resolve()
-        return str(cand)
+    # If the user gave an explicit phlux_lab/... path or src/... path, anchor to repo_root
+    if s.startswith("phlux_lab/") or s.startswith("src/") or s.startswith("logs/"):
+        return str((repo_root / s).resolve())
 
-    # Try cwd-relative first
-    cand1 = (Path.cwd() / raw).resolve()
-    if cand1.exists():
-        return str(cand1)
+    # Otherwise treat as relative to phlux_lab
+    return str((lab_root / s).resolve())
 
-    # Try repo-root relative
-    cand2 = (repo_root / raw).resolve()
-    if cand2.exists():
-        return str(cand2)
 
-    # Try lab-root relative (sometimes helpful)
-    cand3 = (lab_root / raw).resolve()
-    return str(cand3)
-
+# =============================================================================
+# Preprocessor
+# =============================================================================
 
 class Preprocessor:
     """
-    Preprocessing for VFM models with:
-      - Optional user-units -> canonical (SI) conversion using schema sidecar YAML
-      - Derived feature computation (data_cfg["derived_features"])
-      - Optional train-time noise augmentation (additive / relative / hybrid)
-      - Scaling for X and y
+    Preprocessor responsibilities:
+      - Load CSV
+      - Apply derived feature engineering (from YAML)
+      - Optionally apply training noise (from YAML)
+      - Fit StandardScaler for X and y
+      - Provide transform_X and inverse_transform_y for inference usage
+      - Save/load as a joblib artifact
 
-    This module is used from the *package* path:
-      phlux_lab/src/phlux_lab/utils/preprocessor.py
-
-    New in stacked workflow:
-      - `Preprocessor.from_config()` adapts your training_config.yaml stage blocks into this class.
-      - Supports BOTH stage layouts:
-          A) legacy/nested:
-              models.<stage>.data.train_dataset, input_features, target_features, derived_features, ...
-              models.<stage>.model.<hyperparams...>
-          B) flat:
-              models.<stage>.train_dataset, inputs, targets, stack_inputs, ...
+    Compatible with your current scripts:
+      - Preprocessor.from_config(cfg_one, stage_name=..., dataset="train"/"test", global_preprocessing=...)
+      - .x_input_scaled, .y_output_scaled used during training
+      - .transform_X(df) used for predictions
+      - .inverse_transform_y(y_scaled) used after model prediction
+      - .save(path) / .load(path)
     """
 
-    # ------------------------------
-    # Target transform defaults (log1p for flow-like targets)
-    # ------------------------------
     ENABLE_FLOW_LOG1P_DEFAULT: bool = True
+    ENABLE_WEAR_LOG1P_DEFAULT: bool = False  # NEW: log1p for wear target
+
     _FLOW_INCLUDE_TOKENS = ("flow", "q_liquid", "q_", "rate", "vol_flow", "volume_flow")
     _FLOW_EXCLUDE_TOKENS = ("wear", "prob", "probability", "pct", "percent", "class", "label", "delta_")
+
+    # -------------------------------------------------------------------------
+    # Construction helpers
+    # -------------------------------------------------------------------------
 
     @classmethod
     def from_config(
@@ -96,544 +88,569 @@ class Preprocessor:
         global_preprocessing: Optional[Dict[str, Any]] = None,
     ) -> "Preprocessor":
         """
-        Adapter from training_config.yaml stage block to this Preprocessor.
+        Build a Preprocessor from a per-stage config snippet (cfg_one), plus
+        optional global preprocessing block (from master YAML).
 
-        Supports:
-          - cfg_one["data"]["train_dataset"] (legacy)
-          - cfg_one["train_dataset"]         (flat)
+        Expected cfg_one shape (as your pipeline uses):
+        cfg_one = {
+          "data": {
+            "train_dataset": "...csv",
+            "test_dataset": "...csv",
+            "inputs": [...],
+            "stack_inputs": [...],      # optional
+            "targets": [...],
+          }
+        }
 
-        Inputs/targets:
-          - legacy: data.input_features + data.stack_inputs (optional)
-                    data.target_features
-          - flat:   inputs + stack_inputs (optional)
-                    targets
+        global_preprocessing expected shape (from training_config.yaml):
+        preprocessing:
+          noise: { enabled: true, features: {...}, seed: 42? }
+          feature_engineering: [ {name, type, inputs, apply_to?}, ... ]
         """
-        ds = dataset.strip().lower()
+        ds = str(dataset).lower().strip()
         if ds not in ("train", "test"):
             raise ValueError("dataset must be 'train' or 'test'")
 
-        data_block = cfg_one.get("data", {}) if isinstance(cfg_one.get("data", {}), dict) else {}
+        stage_name = str(stage_name or cfg_one.get("stage_name") or cfg_one.get("stage") or "").strip()
 
-        # ---- dataset paths ----
-        csv_path = None
-        if data_block:
-            csv_path = data_block.get("train_dataset") if ds == "train" else data_block.get("test_dataset")
+        data_block = cfg_one.get("data", {}) if isinstance(cfg_one.get("data"), dict) else {}
+
+        # Choose dataset path
+        csv_path = data_block.get("train_dataset") if ds == "train" else data_block.get("test_dataset")
         if not csv_path:
+            # fallback keys if user passed alternative schema
             csv_path = cfg_one.get("train_dataset") if ds == "train" else cfg_one.get("test_dataset")
         if not csv_path:
-            raise KeyError(f"Stage config missing {'train_dataset' if ds=='train' else 'test_dataset'}")
+            raise ValueError(f"[{stage_name or 'unknown'}] Missing {ds}_dataset path in config")
 
-        # ---- inputs / stack inputs ----
-        inputs: List[str] = []
-        stack_inputs: List[str] = []
-        targets: List[str] = []
+        raw_inputs = list(
+            data_block.get("inputs")
+            or data_block.get("input_features")
+            or cfg_one.get("inputs")
+            or cfg_one.get("input_features")
+            or []
+        )
+        stack_inputs = list(
+            data_block.get("stack_inputs")
+            or cfg_one.get("stack_inputs")
+            or []
+        )
+        targets = list(
+            data_block.get("targets")
+            or data_block.get("target_features")
+            or cfg_one.get("targets")
+            or []
+        )
 
-        if data_block:
-            inputs = list(data_block.get("input_features", []) or [])
-            stack_inputs = list(data_block.get("stack_inputs", []) or [])
-            targets = list(data_block.get("target_features", []) or [])
-        else:
-            inputs = list(cfg_one.get("inputs", []) or [])
-            stack_inputs = list(cfg_one.get("stack_inputs", []) or [])
-            targets = list(cfg_one.get("targets", []) or [])
+        if not raw_inputs:
+            raise ValueError(f"[{stage_name}] No inputs defined")
+        if not targets:
+            raise ValueError(f"[{stage_name}] No targets defined")
 
-        # Include stacked inputs in the input_features list
-        input_features = inputs.copy()
-        for c in stack_inputs:
+        # Ordered union: raw → stacked (dedupe)
+        input_features: List[str] = []
+        for c in raw_inputs + stack_inputs:
             if c not in input_features:
                 input_features.append(c)
 
-        # ---- derived features ----
+        # Derived features (stage overrides first, then global preprocessing)
         derived_features: List[Dict[str, Any]] = []
-        if data_block and data_block.get("derived_features") is not None:
-            derived_features = [dict(x) for x in (data_block.get("derived_features") or [])]
-        elif global_preprocessing and global_preprocessing.get("feature_engineering") is not None:
-            derived_features = [dict(x) for x in (global_preprocessing.get("feature_engineering") or [])]
+        if isinstance(data_block.get("derived_features"), list):
+            derived_features = list(data_block["derived_features"])
+        elif global_preprocessing and isinstance(global_preprocessing.get("feature_engineering"), list):
+            derived_features = list(global_preprocessing["feature_engineering"])
 
-        # ---- noise ----
+        # Noise (stage overrides first, then global)
         noise_block: Dict[str, Any] = {"enabled": False}
-        if data_block and data_block.get("noise") is not None:
-            noise_block = dict(data_block.get("noise") or {})
-        elif global_preprocessing and global_preprocessing.get("noise") is not None:
-            noise_block = dict(global_preprocessing.get("noise") or {})
+        if isinstance(data_block.get("noise"), dict):
+            noise_block = dict(data_block["noise"])
+        elif global_preprocessing and isinstance(global_preprocessing.get("noise"), dict):
+            noise_block = dict(global_preprocessing["noise"])
 
-        # Normalize "pretty" noise format: features: {col: [0, sigma]} into {col: {mode,sigma,clip}}
-        if isinstance(noise_block, dict):
-            features = noise_block.get("features", {}) or {}
-            if isinstance(features, dict):
-                normed: Dict[str, Any] = {}
-                for k, v in features.items():
-                    if isinstance(v, (list, tuple)) and len(v) == 2:
-                        _lo, hi = float(v[0]), float(v[1])
-                        normed[k] = {"mode": noise_block.get("default_mode", "additive"), "sigma": hi, "clip": None}
-                    else:
-                        normed[k] = v
-                noise_block["features"] = normed
-            noise_block.setdefault("apply_to", "train_only")
-            noise_block.setdefault("random_seed", 42)
-            noise_block.setdefault("default_mode", "additive")
 
-        # ---- schema / unit policy ----
-        schema_path = ""
-        unit_policy: Dict[str, Any] = {}
-        if data_block:
-            schema_path = str(data_block.get("schema_path", "") or "")
-            unit_policy = dict(data_block.get("unit_policy", {}) or {})
+        # Sample weighting (stage overrides first, then global)
+        sample_weighting_block: Dict[str, Any] = {"enabled": False}
+        if isinstance(data_block.get("sample_weighting"), dict):
+            sample_weighting_block = dict(data_block["sample_weighting"])
+        elif global_preprocessing and isinstance(global_preprocessing.get("sample_weighting"), dict):
+            sample_weighting_block = dict(global_preprocessing["sample_weighting"])
 
-        csv_path = _resolve_repo_path(str(csv_path))
-        data_cfg: Dict[str, Any] = {
-            "stage_name": str(stage_name or cfg_one.get("stage_name", "") or ""),
-            "csv_path": str(csv_path),
-            "input_features": input_features,
-            "targets": targets,
-            "schema_path": schema_path,
-            "unit_policy": unit_policy,
-            "derived_features": derived_features,
-            "noise": noise_block,
-            "enable_flow_log1p": bool(
-                (data_block.get("enable_flow_log1p") if data_block else None)
-                if (data_block.get("enable_flow_log1p") if data_block else None) is not None
-                else cfg_one.get("enable_flow_log1p", cls.ENABLE_FLOW_LOG1P_DEFAULT)
-            ),
-        }
+        schema_path = data_block.get("schema_path", "")
+        unit_policy = dict(data_block.get("unit_policy", {}) or {})
 
-        return cls(data_cfg)
+        # Optional seed: prefer noise.seed, else cfg_one/global keys if present
+        seed = None
+        if isinstance(noise_block, dict) and "seed" in noise_block:
+            try:
+                seed = int(noise_block["seed"])
+            except Exception:
+                seed = None
+        if seed is None:
+            # if user put random_seed in cfg_one
+            for k in ("random_seed", "seed"):
+                if k in cfg_one:
+                    try:
+                        seed = int(cfg_one[k])
+                        break
+                    except Exception:
+                        pass
 
-    # ------------------------------
-    # Init / Load (training)
-    # ------------------------------
+        return cls(
+            {
+                "stage_name": stage_name,
+                "dataset": ds,
+                "csv_path": _resolve_repo_path(str(csv_path)),
+                "raw_inputs": raw_inputs,
+                "stack_inputs": stack_inputs,
+                "input_features": input_features,
+                "targets": targets,
+                "schema_path": schema_path,
+                "unit_policy": unit_policy,
+                "derived_features": derived_features,
+                "noise": noise_block,
+                "noise_seed": seed,
+                "sample_weighting": sample_weighting_block,
+                "enable_flow_log1p": cfg_one.get("enable_flow_log1p", cls.ENABLE_FLOW_LOG1P_DEFAULT),
+                # NEW: wear target log1p (stage-specific; we gate by stage_name later too)
+                "enable_wear_log1p": cfg_one.get("enable_wear_log1p", cls.ENABLE_WEAR_LOG1P_DEFAULT),
+            }
+        )
+
     def __init__(self, data_cfg: Dict[str, Any]) -> None:
-        # Required config
-        self.csv_path: str = data_cfg["csv_path"]
+        self.stage_name: str = str(data_cfg.get("stage_name") or "")
+        self.dataset: str = str(data_cfg.get("dataset") or "train").lower().strip()
+
+        self.csv_path: str = str(data_cfg["csv_path"])
+
+        self.raw_inputs: List[str] = list(data_cfg.get("raw_inputs", []))
+        self.stack_inputs: List[str] = list(data_cfg.get("stack_inputs", []))
+
         self.input_features: List[str] = list(data_cfg["input_features"])
         self.target_features: List[str] = list(data_cfg["targets"])
 
-        # Stage name (for stage-scoped feature engineering)
-        self.stage_name: str = str(data_cfg.get("stage_name", "") or "").strip()
-
-        # Optional: schema + unit policy
-        self.schema_path: str = str(data_cfg.get("schema_path", "") or "")
-        self.unit_policy: Dict[str, Any] = dict(data_cfg.get("unit_policy", {}) or {})
+        self.schema_path: str = str(data_cfg.get("schema_path") or "")
+        self.unit_policy: Dict[str, Any] = dict(data_cfg.get("unit_policy") or {})
         self.convert_inputs_to_canonical: bool = bool(self.unit_policy.get("convert_inputs_to_canonical", False))
         self.convert_targets_to_canonical: bool = bool(self.unit_policy.get("convert_targets_to_canonical", False))
-        self.canonical_internal_system: str = str(self.unit_policy.get("canonical_internal_system", "SI"))
 
-        # Optional derived features config
-        self.derived_cfg: List[Dict[str, Any]] = list(data_cfg.get("derived_features", []) or [])
-
-        # Optional noise config
+        self.derived_cfg: List[Dict[str, Any]] = list(data_cfg.get("derived_features", []))
         self.noise_cfg: Dict[str, Any] = dict(data_cfg.get("noise", {}) or {})
         self.noise_enabled: bool = bool(self.noise_cfg.get("enabled", False))
-        self.noise_apply_to: str = str(self.noise_cfg.get("apply_to", "train_only")).strip().lower()
-        self.noise_seed: int = int(self.noise_cfg.get("random_seed", 42))
-        self.noise_features: Dict[str, Any] = dict(self.noise_cfg.get("features", {}) or {})
-        self.default_noise_mode: str = str(self.noise_cfg.get("default_mode", "additive")).strip().lower()
-        self._noise_rng = np.random.default_rng(self.noise_seed)
 
-        # Schema mapping: column_name -> user_unit (as stored in schema)
-        self._schema_units_by_col: Dict[str, str] = {}
-        if self.schema_path:
-            self._schema_units_by_col = self._load_schema_units(self.schema_path)
 
-        # Target-transform bookkeeping (stored in artifact)
+        # Sample weighting config (training only)
+        self.sample_weight_cfg: Dict[str, Any] = dict(data_cfg.get("sample_weighting", {}) or {})
+        self.sample_weight_enabled: bool = bool(self.sample_weight_cfg.get("enabled", False))
+        self.sample_weight_scheme: str = str(self.sample_weight_cfg.get("scheme", "")).strip().lower()
+        self.sample_weights: Optional[np.ndarray] = None
+        self.sample_weight_target_used: Optional[str] = None
+
+        self.noise_seed: Optional[int] = None
+        if "noise_seed" in data_cfg:
+            try:
+                self.noise_seed = int(data_cfg["noise_seed"]) if data_cfg["noise_seed"] is not None else None
+            except Exception:
+                self.noise_seed = None
+
         self.enable_flow_log1p: bool = bool(data_cfg.get("enable_flow_log1p", self.ENABLE_FLOW_LOG1P_DEFAULT))
-        self._log1p_target_indices: List[int] = []
+        # NEW
+        self.enable_wear_log1p: bool = bool(data_cfg.get("enable_wear_log1p", self.ENABLE_WEAR_LOG1P_DEFAULT))
 
         # Load CSV
         self.df: pd.DataFrame = pd.read_csv(self.csv_path)
 
-        # Validate base columns exist (before conversion/derived)
-        missing_inputs = [c for c in self.input_features if c not in self.df.columns]
-        missing_targets = [c for c in self.target_features if c not in self.df.columns]
-        if missing_inputs or missing_targets:
+        # Apply derived features BEFORE validation (because they may be requested as inputs)
+        self._apply_derived_features_inplace()
+
+        # Apply noise AFTER derived features but BEFORE scaling (training only)
+        self._apply_noise_inplace()
+
+        # Validate required columns exist after derivation/noise
+        missing = [c for c in (self.input_features + self.target_features) if c not in self.df.columns]
+        if missing:
             raise ValueError(
-                "Missing columns in CSV.\n"
-                f"  Missing inputs: {missing_inputs}\n"
-                f"  Missing targets: {missing_targets}\n"
-                f"  CSV path: {self.csv_path}\n"
-                f"  Available columns: {list(self.df.columns)}"
+                f"[{self.stage_name}] Missing columns in CSV after preprocessing:\n"
+                + "\n".join(f"  - {c}" for c in missing)
             )
 
-        # 1) Convert USER -> CANONICAL (SI) before any derived features or scaling
-        if self._should_convert_inputs_now():
-            self._convert_columns_user_to_canonical_inplace(self.df, self.input_features)
-
-        if self._should_convert_targets_now():
-            self._convert_columns_user_to_canonical_inplace(self.df, self.target_features)
-
-        # 2) Derived features
-        if self.derived_cfg:
-            self._add_derived_features_inplace(self.df)
-
-        # Re-validate after derived
-        missing_inputs2 = [c for c in self.input_features if c not in self.df.columns]
-        missing_targets2 = [c for c in self.target_features if c not in self.df.columns]
-        if missing_inputs2 or missing_targets2:
-            raise ValueError(
-                "Missing columns after preprocessing.\n"
-                f"  Missing inputs: {missing_inputs2}\n"
-                f"  Missing targets: {missing_targets2}\n"
-                f"  CSV path: {self.csv_path}\n"
-                f"  Available columns: {list(self.df.columns)}"
-            )
-
-        # Extract arrays
         X_raw = self.df[self.input_features].to_numpy(dtype="float32")
         y_raw = self.df[self.target_features].to_numpy(dtype="float32")
 
-        # 3) Noise on X during fit (if enabled)
-        X_aug = self._maybe_apply_noise_to_X(X_raw, feature_columns=self.input_features, stage="fit")
+        # ---- WEAR target transform (log1p) ----
+        # IMPORTANT: must happen BEFORE computing sample weights
+        if self.stage_name == "wear" and self.enable_wear_log1p:
+            if np.any(y_raw < 0):
+                raise ValueError("[wear] hydraulic_wear contains negative values; cannot apply log1p.")
+            y_raw = np.log1p(y_raw)
 
-        # 3.5) Target transform
-        y_for_scaling = self._transform_targets_for_fit(y_raw)
+        # Compute optional per-sample weights (training-time)
+        # NOTE: weights are now computed in the SAME space as training y
+        self.sample_weights = self._compute_sample_weights(y_raw)
 
-        # 4) Fit scalers
+
+
+        # NOTE: unit conversion hooks exist but are intentionally OFF unless you implement conversions.
+        # Keeping the flags for compatibility with your earlier philosophy.
+        # If you later wire unit conversion, do it here before scaling.
+
         self.scaler_X = StandardScaler()
         self.scaler_y = StandardScaler()
-        self.x_input_scaled = self.scaler_X.fit_transform(X_aug)
-        self.y_output_scaled = self.scaler_y.fit_transform(y_for_scaling)
 
-    # ------------------------------
-    # Target transforms (log1p flow-like targets)
-    # ------------------------------
-    def _infer_log1p_target_indices(self) -> List[int]:
-        idxs: List[int] = []
-        if not self.enable_flow_log1p:
-            return idxs
+        self.x_input_scaled = self.scaler_X.fit_transform(X_raw)
+        self.y_output_scaled = self.scaler_y.fit_transform(y_raw)
 
-        for i, name in enumerate(self.target_features):
-            n = str(name).strip().lower()
-            if not n:
-                continue
-            if any(tok in n for tok in self._FLOW_EXCLUDE_TOKENS):
-                continue
-            if any(tok in n for tok in self._FLOW_INCLUDE_TOKENS):
-                idxs.append(i)
-        return idxs
-
-    def _transform_targets_for_fit(self, y_raw: np.ndarray) -> np.ndarray:
-        if y_raw.ndim != 2:
-            raise ValueError(f"Targets must be 2D (n, y_dim). Got shape {y_raw.shape}")
-
-        self._log1p_target_indices = self._infer_log1p_target_indices()
-        if not self._log1p_target_indices:
-            return y_raw
-
-        y = y_raw.astype("float32", copy=True)
-        for j in self._log1p_target_indices:
-            col = np.maximum(y[:, j], 0.0).astype("float32")
-            y[:, j] = np.log1p(col).astype("float32")
-        return y
-
-    def _inverse_target_transforms_after_inverse_scaling(self, y_inv: np.ndarray) -> np.ndarray:
-        if y_inv.ndim != 2:
-            raise ValueError(f"Inverse targets must be 2D (n, y_dim). Got shape {y_inv.shape}")
-
-        if not getattr(self, "_log1p_target_indices", None):
-            return y_inv
-
-        y = y_inv.astype("float32", copy=True)
-        for j in self._log1p_target_indices:
-            y[:, j] = np.expm1(y[:, j]).astype("float32")
-        return y
-
-    # ------------------------------
-    # Schema helpers
-    # ------------------------------
-    @staticmethod
-    def _load_schema_units(schema_path: str) -> Dict[str, str]:
-        import yaml
-
-        with open(schema_path, "r", encoding="utf-8") as f:
-            schema = yaml.safe_load(f) or {}
-        units: Dict[str, str] = {}
-        for item in schema.get("data", []) or []:
-            name = item.get("name")
-            unit = item.get("unit")
-            if name and unit:
-                units[str(name)] = str(unit)
-        return units
-
-    def _should_convert_inputs_now(self) -> bool:
-        return bool(self.convert_inputs_to_canonical and self.schema_path)
-
-    def _should_convert_targets_now(self) -> bool:
-        return bool(self.convert_targets_to_canonical and self.schema_path)
-
-    def _convert_columns_user_to_canonical_inplace(self, df: pd.DataFrame, cols: List[str]) -> None:
-        for c in cols:
-            if c not in df.columns:
-                continue
-            user_unit = self._schema_units_by_col.get(c)
-            if not user_unit:
-                continue
-            df[c] = convert_user_to_internal_SI(df[c].to_numpy(dtype="float32"), user_unit)
-
-    # ------------------------------
+    # -------------------------------------------------------------------------
     # Derived features
-    # ------------------------------
-    def _add_derived_features_inplace(self, df: pd.DataFrame) -> None:
-        """Add derived / engineered features defined in config.
+    # -------------------------------------------------------------------------
 
-        Supports stage scoping via spec["apply_to"].
-
-        Behavior:
-          - If spec has apply_to (list/str) and current stage_name is not included -> skip.
-          - If required input columns are missing -> skip (common for *_pred early stages).
-          - Only append derived feature to self.input_features if it applies to this stage.
+    def _apply_derived_features_inplace(self) -> None:
         """
-        stage = (self.stage_name or "").strip()
-        for spec in self.derived_cfg:
-            name = spec.get("name")
-            op_type = str(spec.get("type", "")).strip().lower()
-            inputs = list(spec.get("inputs", []) or [])
-            eps = float(spec.get("eps", 0.0) or 0.0)
+        Implements your YAML feature_engineering list.
 
-            if not name or not op_type or len(inputs) < 2:
+        Supported:
+          - type: "subtract" -> out = a - b
+          - type: "divide"   -> out = a / (b + eps)
+
+        Honors:
+          - apply_to: [flow, wear, flow_correction] (if present)
+        """
+        if not self.derived_cfg:
+            return
+
+        for spec in self.derived_cfg:
+            if not isinstance(spec, dict):
                 continue
 
-            # ---- stage scoping (optional) ----
-            apply_to = spec.get("apply_to", None)
-            if apply_to is not None:
-                if isinstance(apply_to, str):
-                    apply_list = [apply_to]
-                elif isinstance(apply_to, (list, tuple)):
-                    apply_list = list(apply_to)
-                else:
-                    apply_list = []
-                apply_list = [str(x).strip() for x in apply_list if str(x).strip()]
-                if stage and apply_list and stage not in apply_list:
+            apply_to = spec.get("apply_to")
+            if isinstance(apply_to, list) and self.stage_name:
+                if self.stage_name not in apply_to:
                     continue
 
-            a, b = inputs[0], inputs[1]
+            name = str(spec.get("name") or "").strip()
+            ftype = str(spec.get("type") or "").strip().lower()
+            inputs = spec.get("inputs") or []
 
-            # If required inputs are missing, skip this derived feature.
-            if a not in df.columns or b not in df.columns:
+            if not name or not ftype or not isinstance(inputs, list) or len(inputs) < 2:
                 continue
 
-            if op_type == "subtract":
-                df[name] = df[a].astype("float32") - df[b].astype("float32")
-            elif op_type == "divide":
-                denom = df[b].astype("float32")
-                if eps != 0.0:
-                    denom = denom + float(eps)
-                df[name] = df[a].astype("float32") / denom
+            a = str(inputs[0])
+            b = str(inputs[1])
+
+            # If required columns don't exist, we skip (final validation will catch if the derived feature is required)
+            if a not in self.df.columns or b not in self.df.columns:
+                continue
+
+            if ftype == "subtract":
+                self.df[name] = self.df[a] - self.df[b]
+            elif ftype == "divide":
+                eps = float(spec.get("eps", 1e-6))
+                self.df[name] = self.df[a] / (self.df[b] + eps)
             else:
-                raise ValueError(f"Unsupported derived feature type: {op_type}")
+                # Unknown type => ignore
+                continue
 
-            # Ensure derived features are available as model inputs *for this stage*.
-            if name not in self.input_features:
-                self.input_features.append(name)
+    # -------------------------------------------------------------------------
+    # Noise injection
+    # -------------------------------------------------------------------------
 
-    # ------------------------------
-    # Noise helpers
-    # ------------------------------
-    def _get_feature_noise_cfg(self, feature: str) -> Optional[Dict[str, Any]]:
-        cfg = self.noise_features.get(feature)
-        if not cfg:
+    def _stable_noise_seed(self) -> int:
+        """
+        Deterministic fallback seed if user didn't provide one.
+        """
+        s = f"{self.stage_name}|{self.csv_path}"
+        # stable across runs in same python version
+        return int(abs(hash(s)) % (2**32))
+
+    def _apply_noise_inplace(self) -> None:
+        """
+        Applies multiplicative Gaussian noise to selected input features:
+          x_noisy = x * (1 + N(0, sigma))
+
+        Only applies for dataset == "train" and if noise.enabled == True.
+
+        YAML example:
+          noise:
+            enabled: true
+            features:
+              suction_pressure: 0.05
+              discharge_pressure: 0.05
+        """
+        if self.dataset != "train":
+            return
+        if not self.noise_enabled:
+            return
+
+        feats = self.noise_cfg.get("features", {})
+        if not isinstance(feats, dict) or not feats:
+            return
+
+        seed = self.noise_seed if self.noise_seed is not None else self._stable_noise_seed()
+        rng = np.random.default_rng(seed)
+
+        for col, sigma in feats.items():
+            if col not in self.df.columns:
+                continue
+            try:
+                s = float(sigma)
+            except Exception:
+                continue
+            if s <= 0:
+                continue
+
+            x = self.df[col].to_numpy(dtype=float)
+            n = rng.normal(loc=0.0, scale=s, size=x.shape)
+            self.df[col] = x * (1.0 + n)
+
+
+
+    # -------------------------------------------------------------------------
+    # Sample weighting (training-time)
+    # -------------------------------------------------------------------------
+
+    def _compute_sample_weights(self, y_raw: np.ndarray) -> Optional[np.ndarray]:
+        """Compute per-sample weights for training based on preprocessing.sample_weighting.
+
+        Supports the YAML structure:
+          preprocessing:
+            sample_weighting:
+              enabled: true
+              scheme: by_target_bins | by_percentile
+              rules:
+                <target_name>:
+                  bins: [...]
+                  weights: [...]
+
+        Notes:
+          - Only applies for dataset == "train"
+          - If multiple targets exist for a stage, we use the first target that has a rule.
+          - Returns a 1D float32 array of length n_samples, or None.
+        """
+        if self.dataset != "train":
             return None
-        if isinstance(cfg, dict):
-            return cfg
-        # if someone gave a scalar, treat as sigma additive
+        if not self.sample_weight_enabled:
+            return None
+
+        rules = self.sample_weight_cfg.get("rules", {})
+        if not isinstance(rules, dict) or not rules:
+            # Backward compatible fallback: legacy schema with 'target/bins/weights'
+            legacy_target = self.sample_weight_cfg.get("target")
+            if legacy_target and isinstance(legacy_target, str):
+                rules = {legacy_target: {
+                    "bins": self.sample_weight_cfg.get("bins"),
+                    "weights": self.sample_weight_cfg.get("weights"),
+                }}
+            else:
+                return None
+
+        # Choose target to weight (first matching rule)
+        tgt_used = None
+        rule_used = None
+        for t in self.target_features:
+            if t in rules and isinstance(rules[t], dict):
+                tgt_used = t
+                rule_used = rules[t]
+                break
+
+        if tgt_used is None or rule_used is None:
+            return None
+
+        self.sample_weight_target_used = tgt_used
+
+        # Extract y vector for the chosen target
+        # y_raw shape is (n, n_targets)
         try:
-            return {"mode": self.default_noise_mode, "sigma": float(cfg), "clip": None}
-        except Exception:
+            j = self.target_features.index(tgt_used)
+        except ValueError:
             return None
 
-    def _compute_sigma(self, col: np.ndarray, cfg: Dict[str, Any]) -> np.ndarray:
-        mode = str(cfg.get("mode", self.default_noise_mode)).strip().lower()
-        sigma = float(cfg.get("sigma", 0.0) or 0.0)
+        y = np.asarray(y_raw[:, j], dtype=float)
 
-        if sigma <= 0.0:
-            return np.zeros_like(col, dtype="float32")
+        bins = rule_used.get("bins")
+        weights = rule_used.get("weights")
+        if not isinstance(bins, list) or not isinstance(weights, list):
+            return None
+        if len(bins) == 0 or len(weights) == 0:
+            return None
+        if len(bins) != len(weights):
+            raise ValueError(
+                f"[{self.stage_name}] sample_weighting rule for '{tgt_used}' requires "
+                f"len(bins) == len(weights), got {len(bins)} and {len(weights)}"
+            )
 
-        if mode == "additive":
-            return np.full_like(col, sigma, dtype="float32")
-        if mode == "relative":
-            return (np.abs(col).astype("float32") * sigma).astype("float32")
-        if mode == "hybrid":
-            base = np.full_like(col, sigma, dtype="float32")
-            rel = (np.abs(col).astype("float32") * sigma).astype("float32")
-            return (base + rel).astype("float32")
+        # Determine scheme
+        scheme = self.sample_weight_scheme or str(self.sample_weight_cfg.get("scheme", "")).strip().lower()
+        if scheme not in ("by_target_bins", "by_percentile"):
+            raise ValueError(
+                f"[{self.stage_name}] sample_weighting.scheme must be 'by_target_bins' or 'by_percentile', got '{scheme}'"
+            )
 
-        return np.full_like(col, sigma, dtype="float32")
+        # Convert bins to numeric
+        try:
+            bins_arr = np.asarray([float(b) for b in bins], dtype=float)
+            w_arr = np.asarray([float(w) for w in weights], dtype=float)
+        except Exception as e:
+            raise ValueError(f"[{self.stage_name}] sample_weighting bins/weights must be numeric: {e}")
 
-    @staticmethod
-    def _apply_clip_if_configured(
-        x: np.ndarray, clip: Optional[Union[List[float], Tuple[float, float]]]
-    ) -> np.ndarray:
-        if not clip:
-            return x.astype("float32")
-        lo = float(clip[0]) if clip[0] is not None else -np.inf
-        hi = float(clip[1]) if clip[1] is not None else np.inf
-        return np.clip(x, lo, hi).astype("float32")
-
-    def _maybe_apply_noise_to_X(
-        self,
-        X: np.ndarray,
-        feature_columns: List[str],
-        stage: str,
-        enable_override: Optional[bool] = None,
-    ) -> np.ndarray:
-        enabled = bool(enable_override) if enable_override is not None else self.noise_enabled
-        if not enabled or self.noise_apply_to == "none":
-            return X
-        if self.noise_apply_to == "train_only" and stage != "fit":
-            return X
-
-        Xn = X.copy()
-        for j, col in enumerate(feature_columns):
-            cfg = self._get_feature_noise_cfg(col)
-            if not cfg:
-                continue
-
-            sigma = self._compute_sigma(Xn[:, j], cfg)
-            if not np.any(sigma > 0):
-                Xn[:, j] = self._apply_clip_if_configured(Xn[:, j], cfg.get("clip"))
-                continue
-
-            noise = self._noise_rng.normal(loc=0.0, scale=sigma, size=Xn[:, j].shape).astype("float32")
-            Xn[:, j] = (Xn[:, j] + noise).astype("float32")
-            Xn[:, j] = self._apply_clip_if_configured(Xn[:, j], cfg.get("clip"))
-
-        return Xn.astype("float32")
-
-    # ------------------------------
-    # Public transforms
-    # ------------------------------
-    def transform_X(
-        self,
-        x_raw: Union[pd.DataFrame, np.ndarray, List[List[float]]],
-        *,
-        apply_noise: bool = False,
-    ) -> np.ndarray:
-        if isinstance(x_raw, pd.DataFrame):
-            df = x_raw.copy()
-
-            if self._should_convert_inputs_now():
-                self._convert_columns_user_to_canonical_inplace(df, [c for c in self.input_features if c in df.columns])
-
-            if self.derived_cfg:
-                self._add_derived_features_inplace(df)
-
-            missing = [c for c in self.input_features if c not in df.columns]
-            if missing:
-                raise KeyError(
-                    "Input DataFrame is missing required columns for transform_X:\n"
-                    + "\n".join([f"  - {c}" for c in missing])
-                )
-            X = df[self.input_features].to_numpy(dtype="float32")
+        if scheme == "by_percentile":
+            # bins are percentiles (e.g., [0, 50, 90, 100]) -> convert to value edges
+            if np.any((bins_arr < 0) | (bins_arr > 100)):
+                raise ValueError(f"[{self.stage_name}] by_percentile bins must be within [0, 100]")
+            edges = np.percentile(y, bins_arr)
         else:
-            X = np.asarray(x_raw, dtype="float32")
-            if X.ndim != 2:
-                raise ValueError(f"transform_X expects 2D array; got shape {X.shape}")
-            if X.shape[1] != len(self.input_features):
-                raise ValueError(
-                    f"transform_X received {X.shape[1]} cols, artifact expects {len(self.input_features)}: {self.input_features}"
-                )
+            # bins are value edges directly
+            edges = bins_arr
 
-        if apply_noise:
-            X = self._maybe_apply_noise_to_X(X, self.input_features, stage="transform", enable_override=True)
+        # Assign each sample to an interval [edges[i], edges[i+1]) with i in [0, n-2]
+        # With len(edges)==len(weights), we interpret weights[i] as the weight for interval i,
+        # except the last weight applies to y >= edges[-1].
+        # This matches your comment "bin i -> weight weights[i]" when bins are ascending edges.
+        order_ok = np.all(np.diff(edges) >= 0)
+        if not order_ok:
+            raise ValueError(f"[{self.stage_name}] sample_weighting bins must be ascending")
 
+        idx = np.searchsorted(edges, y, side="right") - 1
+        idx = np.clip(idx, 0, len(w_arr) - 1)
+
+        sw = w_arr[idx].astype("float32")
+        return sw
+
+    # -------------------------------------------------------------------------
+    # Transform / inverse-transform
+    # -------------------------------------------------------------------------
+
+    def transform_X(self, df: pd.DataFrame) -> np.ndarray:
+        """
+        Transform a raw dataframe to scaled X in the same feature order.
+        Applies derived features (same rules) but does NOT apply noise.
+        """
+        work = df.copy()
+
+        # Apply derived features for inference path too (but no noise)
+        if self.derived_cfg:
+            for spec in self.derived_cfg:
+                if not isinstance(spec, dict):
+                    continue
+
+                apply_to = spec.get("apply_to")
+                if isinstance(apply_to, list) and self.stage_name:
+                    if self.stage_name not in apply_to:
+                        continue
+
+                name = str(spec.get("name") or "").strip()
+                ftype = str(spec.get("type") or "").strip().lower()
+                inputs = spec.get("inputs") or []
+                if not name or not ftype or not isinstance(inputs, list) or len(inputs) < 2:
+                    continue
+
+                a = str(inputs[0])
+                b = str(inputs[1])
+                if a not in work.columns or b not in work.columns:
+                    continue
+
+                if ftype == "subtract":
+                    work[name] = work[a] - work[b]
+                elif ftype == "divide":
+                    eps = float(spec.get("eps", 1e-6))
+                    work[name] = work[a] / (work[b] + eps)
+
+        missing = [c for c in self.input_features if c not in work.columns]
+        if missing:
+            raise ValueError(
+                f"[{self.stage_name}] transform_X missing columns:\n"
+                + "\n".join(f"  - {c}" for c in missing)
+            )
+
+        X = work[self.input_features].to_numpy(dtype="float32")
         return self.scaler_X.transform(X)
 
-    def inverse_transform_y(self, y_scaled: Union[np.ndarray, List[List[float]]]) -> np.ndarray:
-        y_scaled_arr = np.asarray(y_scaled, dtype="float32")
-        y_inv = self.scaler_y.inverse_transform(y_scaled_arr)
-        return self._inverse_target_transforms_after_inverse_scaling(y_inv)
+    def inverse_transform_y(self, y_scaled: np.ndarray) -> np.ndarray:
+        """
+        Inverse transform scaled targets back to original target units.
+        Applies expm1 for wear stage if enable_wear_log1p is enabled.
+        """
+        y_scaled = np.asarray(y_scaled)
+        if y_scaled.ndim == 1:
+            y_scaled = y_scaled.reshape(-1, 1)
 
-    # ------------------------------
+        y = self.scaler_y.inverse_transform(y_scaled)
+
+        # ---- WEAR inverse transform (expm1) ----
+        if self.stage_name == "wear" and getattr(self, "enable_wear_log1p", False):
+            y = np.expm1(y)
+            y = np.clip(y, 0.0, None)  # safety: never negative
+
+        return y
+
+    # -------------------------------------------------------------------------
     # Introspection helpers
-    # ------------------------------
+    # -------------------------------------------------------------------------
+
     def get_input_feature_names(self) -> List[str]:
         return list(self.input_features)
 
     def get_target_feature_names(self) -> List[str]:
         return list(self.target_features)
 
-    # ------------------------------
-    # Artifact helpers (save/load)
-    # ------------------------------
+    # -------------------------------------------------------------------------
+    # Serialization
+    # -------------------------------------------------------------------------
+
     def to_artifact(self) -> Dict[str, Any]:
         return {
-            "stage_name": str(getattr(self, "stage_name", "")),
-            "input_features": list(self.input_features),
-            "target_features": list(self.target_features),
+            "stage_name": self.stage_name,
+            "dataset": self.dataset,
+            "input_features": self.input_features,
+            "target_features": self.target_features,
             "scaler_X": self.scaler_X,
             "scaler_y": self.scaler_y,
-            "derived_features": list(self.derived_cfg),
-            "schema_units_by_col": dict(self._schema_units_by_col),
-            "unit_policy": dict(self.unit_policy),
-            "canonical_internal_system": self.canonical_internal_system,
-            "enable_flow_log1p": bool(getattr(self, "enable_flow_log1p", self.ENABLE_FLOW_LOG1P_DEFAULT)),
-            "log1p_target_indices": list(getattr(self, "_log1p_target_indices", []) or []),
+            "derived_cfg": self.derived_cfg,
+            "enable_flow_log1p": self.enable_flow_log1p,
+            "enable_wear_log1p": self.enable_wear_log1p,  # NEW
         }
 
-    def save_artifact(self, path: str) -> str:
-        try:
-            import joblib  # type: ignore
-        except ImportError as e:
-            raise RuntimeError("joblib is required. Install with: pip install joblib") from e
-
-        import os
-
-        abs_path = os.path.abspath(path)
-        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-        joblib.dump(self.to_artifact(), abs_path)
-        return abs_path
-
-    def save(self, path: str) -> str:
-        return self.save_artifact(path)
+    def save(self, path: str) -> None:
+        import joblib
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(self.to_artifact(), str(out))
 
     @classmethod
     def load(cls, path: str) -> "Preprocessor":
-        try:
-            import joblib  # type: ignore
-        except ImportError as e:
-            raise RuntimeError("joblib is required. Install with: pip install joblib") from e
-        artifact = joblib.load(path)
-        return cls.from_artifact(artifact)
+        import joblib
+        return cls.from_artifact(joblib.load(path))
 
     @classmethod
     def from_artifact(cls, artifact: Dict[str, Any]) -> "Preprocessor":
-        required = {"input_features", "target_features", "scaler_X", "scaler_y"}
-        missing = required.difference(artifact.keys())
-        if missing:
-            raise ValueError(f"Artifact missing keys: {sorted(missing)}")
-
         self = cls.__new__(cls)
-        self.csv_path = ""
-        self.df = pd.DataFrame()
-
-        self.stage_name = str(artifact.get("stage_name", "") or "").strip()
-
-        self.input_features = list(artifact["input_features"])
-        self.target_features = list(artifact["target_features"])
+        self.stage_name = artifact.get("stage_name", "")
+        self.dataset = artifact.get("dataset", "train")
+        self.input_features = artifact["input_features"]
+        self.target_features = artifact["target_features"]
         self.scaler_X = artifact["scaler_X"]
         self.scaler_y = artifact["scaler_y"]
-
-        self.derived_cfg = list(artifact.get("derived_features", []) or [])
-        self._schema_units_by_col = dict(artifact.get("schema_units_by_col", {}) or {})
-        self.unit_policy = dict(artifact.get("unit_policy", {}) or {})
-        self.convert_inputs_to_canonical = bool(self.unit_policy.get("convert_inputs_to_canonical", False))
-        self.convert_targets_to_canonical = bool(self.unit_policy.get("convert_targets_to_canonical", False))
-        self.canonical_internal_system = str(artifact.get("canonical_internal_system", "SI"))
-
+        self.derived_cfg = list(artifact.get("derived_cfg", []))
         self.enable_flow_log1p = bool(artifact.get("enable_flow_log1p", cls.ENABLE_FLOW_LOG1P_DEFAULT))
-        self._log1p_target_indices = list(artifact.get("log1p_target_indices", []) or [])
+        self.enable_wear_log1p = bool(artifact.get("enable_wear_log1p", cls.ENABLE_WEAR_LOG1P_DEFAULT))  # NEW
 
-        # noise config not needed for inference; disable
-        self.noise_cfg = {"enabled": False}
-        self.noise_enabled = False
-        self.noise_apply_to = "none"
-        self.noise_seed = 42
-        self.noise_features = {}
-        self.default_noise_mode = "additive"
-        self._noise_rng = np.random.default_rng(self.noise_seed)
-
-        # schema path not needed at inference (units already canonicalized in training arrays)
+        # fields not required post-load but present for completeness
+        self.raw_inputs = []
+        self.stack_inputs = []
+        self.df = pd.DataFrame()
         self.schema_path = ""
+        self.unit_policy = {}
         self.convert_inputs_to_canonical = False
         self.convert_targets_to_canonical = False
+        self.noise_cfg = {"enabled": False}
+        self.noise_enabled = False
+        self.noise_seed = None
+        self.csv_path = ""
+
+
+        # sample weighting (not used post-load)
+        self.sample_weight_cfg = {"enabled": False}
+        self.sample_weight_enabled = False
+        self.sample_weight_scheme = ""
+        self.sample_weights = None
+        self.sample_weight_target_used = None
 
         return self

@@ -216,15 +216,20 @@ class VFMModel:
         return history
 
     # A thin shim so train_pipeline can call vfm.fit(...)
-    def fit(self, X_scaled: np.ndarray, y_scaled: np.ndarray, model_cfg: Optional[Dict[str, Any]] = None) -> History:
+    def fit(
+        self,
+        X_scaled: np.ndarray,
+        y_scaled: np.ndarray,
+        model_cfg: Optional[Dict[str, Any]] = None,
+        sample_weight=None,
+    ) -> History:
         # Allow per-call overrides (useful if pipeline passes model_cfg)
         if model_cfg:
             self.epochs = int(model_cfg.get("epochs", self.epochs))
             self.batch_size = int(model_cfg.get("batch_size", self.batch_size))
             self.val_split = float(model_cfg.get("val_split", self.val_split))
-        history = self.model.ann_model.fit(
-            X_scaled,
-            y_scaled,
+
+        fit_kwargs = dict(
             validation_split=self.val_split,
             epochs=self.epochs,
             batch_size=self.batch_size,
@@ -232,15 +237,31 @@ class VFMModel:
             callbacks=self.callbacks,
             verbose=1,
         )
+
+        # Only pass sample_weight if provided (preserves prior behavior)
+        if sample_weight is not None:
+            fit_kwargs["sample_weight"] = sample_weight
+
+        history = self.model.ann_model.fit(
+            X_scaled,
+            y_scaled,
+            **fit_kwargs,
+        )
+
         self.history_per_fold.append(history)
         return history
+
 
     # ------------------------------------------------------------------
     # Prediction APIs
     # ------------------------------------------------------------------
-    def predict(self, X_scaled: Union[np.ndarray, list], *, verbose: int = 0) -> np.ndarray:
-        X = np.asarray(X_scaled, dtype="float32")
-        return self.model.ann_model.predict(X, verbose=verbose)
+    def predict(self, X, verbose=0):
+        """
+        Predict using trained ANN.
+        Supports both training-time and inference-loaded models.
+        """
+        ann = getattr(self.model, "ann_model", self.model)
+        return ann.predict(X, verbose=verbose)
 
     def predict_in_units(self, x_raw: Any) -> np.ndarray:
         """Predict from raw user-unit features (DataFrame or array), returning y in original units."""
@@ -266,7 +287,23 @@ class VFMModel:
         return path
 
     @classmethod
-    def load(cls, model_path: str, preprocessor: Preprocessor, model_cfg: Dict[str, Any]) -> "VFMModel":
-        inst = cls.from_config(preprocessor=preprocessor, model_cfg=model_cfg)
-        inst.model.ann_model = tf.keras.models.load_model(model_path)
+    def load(
+        cls,
+        model_path: Path,
+        preprocessor: Preprocessor,
+        model_cfg: dict,
+    ) -> "VFMModel":
+        """
+        Load trained ANN for inference/evaluation.
+        Does NOT rebuild the network.
+        """
+        import tensorflow as tf
+
+        inst = cls.__new__(cls)  # bypass __init__
+
+        inst.preprocessor = preprocessor
+        inst.model_cfg = model_cfg
+        inst.model = tf.keras.models.load_model(model_path)
+
         return inst
+

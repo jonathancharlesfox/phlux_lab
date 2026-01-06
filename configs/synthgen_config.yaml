@@ -111,11 +111,11 @@ data:
           - type: uniform
             weight: 0.7
           - type: beta
-            weight: 0.15
-            a: 0.7
+            weight: 0.2
+            a: 0.7 # controls the pull towards 1
             b: 3.5
           - type: beta
-            weight: 0.15
+            weight: 0.1
             a: 3.5
             b: 0.7
 
@@ -137,7 +137,7 @@ data:
 
     - name: valve_opening
       unit: frac
-      range: [0.15, 0.99]
+      range: [0.1, 0.99]
       sampling:
         method: mixture
         components:
@@ -162,7 +162,24 @@ data:
     #   For mode=clean, generator should override hydraulic_wear to wear_reference.
     - name: hydraulic_wear
       unit: frac
-      range: [0.001, 0.15]
+      range: [0.0001, 0.15]
+      sampling:
+        method: mixture
+        components:
+          - type: beta        # healthy majority
+            weight: 0.6
+            a: 0.4
+            b: 6.0
+
+          - type: beta        # moderate wear
+            weight: 0.25
+            a: 2.0
+            b: 2.0
+
+          - type: beta        # high wear tail
+            weight: 0.15
+            a: 4.0
+            b: 0.6
 
   # ----------------------------
   # Dataset variables (equation-derived outputs ONLY)
